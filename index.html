@@ -1,4 +1,55 @@
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPTP :: Employee Record System (Google Drive)</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  :root{
+    --bg:#05080a; --panel:#0b1315; --panel2:#0f1a1c; --line:#173a2e;
+    --green:#39ff8a; --green-dim:#1c8a52; --cyan:#23d5f0; --amber:#ffb020; --red:#ff3b5c;
+    --text:#cdeee0; --text-dim:#6f9686;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;height:100%;background:var(--bg);}
+  body{ font-family: ui-monospace, 'Consolas', 'Courier New', monospace; color:var(--text); overflow-x:hidden; }
+  #matrix-bg{ position:fixed; inset:0; z-index:0; opacity:0.35; }
+  .scanlines{ position:fixed; inset:0; z-index:1; pointer-events:none;
+    background:repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0px, rgba(0,0,0,0) 2px, rgba(0,0,0,0.35) 3px, rgba(0,0,0,0) 4px);
+    mix-blend-mode:overlay; }
+  .grid-overlay{ position:fixed; inset:0; z-index:0; pointer-events:none;
+    background-image: linear-gradient(rgba(35,213,240,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(35,213,240,0.05) 1px, transparent 1px);
+    background-size: 42px 42px; }
+  #app{ position:relative; z-index:2; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px 60px; }
+  .eyebrow{ font-size:11px; letter-spacing:3px; color:var(--green-dim); text-transform:uppercase; }
+  h1,h2,h3{ font-weight:600; letter-spacing:1px; margin:0; }
+  .glow{ text-shadow:0 0 8px rgba(57,255,138,0.55), 0 0 18px rgba(57,255,138,0.25); }
+  .panel{ background:linear-gradient(180deg, var(--panel) 0%, var(--panel2) 100%); border:1px solid var(--line);
+    border-radius:6px; box-shadow: 0 0 0 1px rgba(57,255,138,0.03), 0 8px 30px rgba(0,0,0,0.6); position:relative; }
+  .panel::before{ content:""; position:absolute; top:0; left:0; right:0; height:2px;
+    background:linear-gradient(90deg, transparent, var(--green), transparent); opacity:0.6; }
+  .btn{ font-family:inherit; cursor:pointer; border-radius:4px; border:1px solid var(--green-dim);
+    background:rgba(57,255,138,0.06); color:var(--green); padding:10px 18px; font-size:13px; letter-spacing:1px;
+    text-transform:uppercase; transition:all .15s ease; }
+  .btn:hover{ background:rgba(57,255,138,0.16); box-shadow:0 0 14px rgba(57,255,138,0.25); }
+  .btn:active{ transform:scale(0.97); }
+  .btn.cyan{ border-color:#0f6a7d; color:var(--cyan); background:rgba(35,213,240,0.06); }
+  .btn.cyan:hover{ background:rgba(35,213,240,0.16); box-shadow:0 0 14px rgba(35,213,240,0.25); }
+  .btn.amber{ border-color:#8a5f10; color:var(--amber); background:rgba(255,176,32,0.06); }
+  .btn.amber:hover{ background:rgba(255,176,32,0.16); box-shadow:0 0 14px rgba(255,176,32,0.25); }
+  .btn.red{ border-color:#8a1c30; color:var(--red); background:rgba(255,59,92,0.06); }
+  .btn.red:hover{ background:rgba(255,59,92,0.16); box-shadow:0 0 14px rgba(255,59,92,0.25); }
+  .btn:disabled{ opacity:0.35; cursor:not-allowed; }
+  input, select, textarea{ font-family:inherit; background:#081010; border:1px solid var(--line); color:var(--text);
+    border-radius:4px; padding:9px 10px; font-size:13.5px; width:100%; outline:none; }
+  input:focus, select:focus, textarea:focus{ border-color:var(--green-dim); box-shadow:0 0 0 2px rgba(57,255,138,0.12); }
+  label{ font-size:12px; color:var(--text-dim); letter-spacing:0.5px; display:block; margin-bottom:5px; }
+  .req::after{ content:" *"; color:var(--red); }
+  .field{ margin-bottom:14px; }
+  .row{ display:flex; gap:14px; flex-wrap:wrap; }
+  .row > .field{ flex:1; min-width:220px; }
+  .radio-group{ display:flex; gap:16px; flex-wrap:wrap; margin-top:4px;}
   .radio-opt{ display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text); cursor:pointer; }
   .radio-opt input{ width:auto; accent-color:var(--green); }
   .hidden{ display:none !important; }
@@ -235,7 +286,7 @@ async function findOrCreateFolder(name, parentId){
   return id;
 }
 async function setupDriveStructure(){
-  rootFolderId = await findOrCreateFolder('Employee Record', 'root');
+  rootFolderId = await findOrCreateFolder('OPTP Employee Record', 'root');
   currentFolderId = await findOrCreateFolder('Current Employees', rootFolderId);
   resignedFolderId = await findOrCreateFolder('Resigned or Retired Employees', rootFolderId);
 }
@@ -767,6 +818,107 @@ function wireFileCardClicks(source){
 }
 
 /* ============ DETAIL MODAL ============ */
+/* ============ PRINT / SAVE AS PDF ============
+   Uses the browser's native print dialog, which lets the user either send
+   to a physical printer or choose "Save as PDF" as the destination -
+   no extra library needed, and it works fully offline. Fields with no
+   value, or "No" answers with an empty follow-up detail, are skipped so
+   the printout only shows information that was actually provided. ============ */
+function escapeHtml(str){
+  return String(str==null?'':str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function pfield(label, value){
+  if(value===undefined || value===null || String(value).trim()==='') return '';
+  return `<div class="prow"><div class="plabel">${escapeHtml(label)}</div><div class="pvalue">${escapeHtml(value)}</div></div>`;
+}
+function buildPrintableHTML(emp){
+  let rows = '';
+  rows += pfield('Position', emp.position);
+  rows += pfield('Full Name', emp.fullName);
+  rows += pfield('Father Name', emp.fatherName);
+  rows += pfield('CNIC Number', emp.cnic);
+  rows += pfield('Father CNIC Number', emp.fatherCnic);
+  rows += pfield('Date of Birth', emp.dob);
+  rows += pfield('Qualification', emp.qualification);
+  if(emp.qualification === 'Graduation Continue') rows += pfield('Qualification Detail', emp.qualificationDetail);
+  rows += pfield('Gender', emp.gender);
+  rows += pfield('Salary', emp.salary);
+  rows += pfield('Joining Date', emp.joiningDate);
+  rows += pfield('Relationship Status', emp.relationshipStatus);
+  if(emp.relationshipStatus === 'Married') rows += pfield('Number of Children', emp.childrenCount);
+  rows += pfield('Permanent Address', emp.permanentAddress);
+  rows += pfield('Temporary Address', emp.temporaryAddress);
+  rows += pfield('Serious Illness', emp.illness);
+  if(emp.illness === 'Yes') rows += pfield('Illness Detail', emp.illnessDetail);
+  rows += pfield('Crime Record', emp.crimeRecord);
+  if(emp.crimeRecord === 'Yes') rows += pfield('Crime Detail', emp.crimeDetail);
+  rows += pfield('Previous Experience', emp.previousExperience);
+  if(emp.previousExperience === 'Yes'){
+    rows += pfield('Experience Detail', emp.prevExpDetail);
+    rows += pfield('Previous Salary', emp.prevSalary);
+    rows += pfield('Reason for Leaving (previous job)', emp.prevReason);
+  }
+  rows += pfield('Courses', emp.courses);
+  rows += pfield('Skills', emp.skills);
+  if(emp.status === 'resigned'){
+    rows += pfield('Exit Type', emp.exitType);
+    rows += pfield('Exit Date', emp.exitDate);
+    rows += pfield('Exit Note', emp.exitNote);
+  }
+  const today = new Date().toLocaleDateString();
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(emp.fullName||'Employee')} - Record</title>
+  <style>
+    body{ font-family: Arial, Helvetica, sans-serif; color:#111; padding:24px; }
+    .phead{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:3px solid #1c8a52; padding-bottom:14px; margin-bottom:20px; }
+    .phead h1{ font-size:20px; margin:0; }
+    .phead .sub{ font-size:11px; color:#555; }
+    .ptop{ display:flex; gap:20px; margin-bottom:20px; align-items:center; }
+    .ptop img.photo{ width:110px; height:110px; object-fit:cover; border:1px solid #ccc; border-radius:4px; }
+    .pname{ font-size:18px; font-weight:bold; }
+    .pposition{ font-size:13px; color:#555; }
+    .pgrid{ display:grid; grid-template-columns:1fr 1fr; gap:0 24px; font-size:12.5px; }
+    .prow{ padding:6px 0; border-bottom:1px solid #eee; break-inside:avoid; }
+    .plabel{ font-size:9.5px; text-transform:uppercase; letter-spacing:0.5px; color:#777; }
+    .pvalue{ margin-top:2px; }
+    .pdocs{ display:flex; gap:14px; margin-top:22px; }
+    .pdocs img{ width:150px; height:100px; object-fit:cover; border:1px solid #ccc; border-radius:4px; }
+    .pdocs .dlbl{ font-size:10px; color:#666; text-align:center; margin-top:4px; }
+    .pfooter{ margin-top:26px; font-size:10px; color:#888; border-top:1px solid #ddd; padding-top:10px; }
+    @media print{ body{ padding:8mm; } }
+  </style></head>
+  <body>
+    <div class="phead">
+      <div><h1>OPTP Restaurant</h1><div class="sub">Employee Record</div></div>
+      <div class="sub">Generated: ${today}</div>
+    </div>
+    <div class="ptop">
+      ${emp.picture ? `<img class="photo" src="${emp.picture}">` : ''}
+      <div>
+        <div class="pname">${escapeHtml(emp.fullName || '(no name)')}</div>
+        <div class="pposition">${escapeHtml(emp.position || '')}</div>
+      </div>
+    </div>
+    <div class="pgrid">${rows}</div>
+    <div class="pdocs">
+      ${emp.cnicFront ? `<div><img src="${emp.cnicFront}"><div class="dlbl">CNIC Front</div></div>` : ''}
+      ${emp.cnicBack ? `<div><img src="${emp.cnicBack}"><div class="dlbl">CNIC Back</div></div>` : ''}
+    </div>
+    <div class="pfooter">OPTP Restaurant &mdash; Confidential Employee Record. Not for external distribution.</div>
+  </body></html>`;
+}
+function openPrintableRecord(emp){
+  const html = buildPrintableHTML(emp);
+  const w = window.open('', '_blank', 'width=900,height=1000');
+  if(!w){ toast('Popup blocked. Please allow popups for this site to print.', true); return; }
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+  const triggerPrint = ()=>{ try{ w.focus(); w.print(); }catch(e){} };
+  w.onload = triggerPrint;
+  setTimeout(triggerPrint, 350);
+}
+
 function detailRow(k,v){ return `<div class="detail-item"><div class="k">${k}</div><div class="v">${(v===undefined||v==='')?'—':v}</div></div>`; }
 function openDetail(id, source){
   const list = source === 'current' ? currentEmployees : resignedEmployees;
@@ -804,6 +956,8 @@ function openDetail(id, source){
         ${source==='resigned' ? detailRow('Exit Note', emp.exitNote) : ''}
       </div>
       <div class="modal-actions">
+        <button class="btn cyan" id="print-btn">Print</button>
+        <button class="btn cyan" id="pdf-btn">Save as PDF</button>
         <button class="btn cyan" id="edit-btn">Edit Record</button>
         ${source==='current' ? `<button class="btn amber" id="resign-btn">Mark Resigned / Retired</button>` : `<button class="btn amber" id="reactivate-btn">Reactivate to Current</button>`}
         <button class="btn red" id="delete-btn">Delete Record</button>
@@ -811,6 +965,8 @@ function openDetail(id, source){
     </div>`;
   document.body.appendChild(overlay);
   document.getElementById('detail-close').onclick = ()=> overlay.remove();
+  document.getElementById('print-btn').onclick = ()=> askPassword('Enter password to print this record', ()=> openPrintableRecord(emp));
+  document.getElementById('pdf-btn').onclick = ()=> askPassword('Enter password to save this record as PDF', ()=> openPrintableRecord(emp));
   document.getElementById('edit-btn').onclick = ()=> askPassword('Enter password to edit this record', ()=>{ overlay.remove(); openEditForm(emp, source); });
   document.getElementById('delete-btn').onclick = ()=> askPassword('Enter password to permanently delete this record', ()=>{
     if(!confirm('This will send "' + (emp.fullName||'this record') + '" to Google Drive Trash. Continue?')) return;
