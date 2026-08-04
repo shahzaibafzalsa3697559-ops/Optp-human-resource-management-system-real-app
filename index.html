@@ -184,6 +184,10 @@ function toast(msg, isErr){
 function uid(){ return 'EMP-' + Date.now() + '-' + Math.floor(Math.random()*9000+1000); }
 
 /* ============ GOOGLE SIGN-IN ============ */
+const LAST_EMAIL_KEY = 'optp_last_signed_in_email';
+let silentAttemptInProgress = false;
+let silentAttemptEmail = null;
+
 function initGis(){
   if(CLIENT_ID.indexOf('PASTE_YOUR_CLIENT_ID_HERE') !== -1){
     console.warn('Set your real CLIENT_ID before using this app.');
@@ -192,19 +196,53 @@ function initGis(){
     client_id: CLIENT_ID,
     scope: SCOPES,
     callback: async (resp)=>{
-      if(resp.error){ toast('Login failed: ' + resp.error, true); return; }
+      const wasSilent = silentAttemptInProgress;
+      const expectedEmail = silentAttemptEmail;
+      silentAttemptInProgress = false;
+      silentAttemptEmail = null;
+      if(resp.error){
+        if(wasSilent){ view='login'; render(); return; }
+        toast('Login failed: ' + resp.error, true);
+        return;
+      }
       accessToken = resp.access_token;
-      await afterLogin();
+      await afterLogin(wasSilent, expectedEmail);
     }
   });
 }
 window.addEventListener('load', ()=>{
   const check = setInterval(()=>{
     if(window.google && google.accounts && google.accounts.oauth2){
-      clearInterval(check); initGis(); render();
+      clearInterval(check); initGis(); attemptAutoLogin();
     }
   }, 200);
 });
+
+function attemptAutoLogin(){
+  let savedEmail = null;
+  try{ savedEmail = localStorage.getItem(LAST_EMAIL_KEY); }catch(e){}
+  if(!savedEmail){ view='login'; render(); return; }
+  view='loading'; render('Restoring your session...');
+  silentAttemptInProgress = true;
+  silentAttemptEmail = savedEmail;
+  let settled = false;
+  const fallbackTimer = setTimeout(()=>{
+    if(!settled){
+      settled = true;
+      silentAttemptInProgress = false;
+      silentAttemptEmail = null;
+      view='login'; render();
+    }
+  }, 7000);
+  const originalCallback = tokenClient.callback;
+  // wrap once so the fallback timer is always cleared once the real callback fires
+  tokenClient.callback = (resp)=>{ settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; originalCallback(resp); };
+  try{
+    tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail });
+  }catch(e){
+    if(!settled){ settled = true; clearTimeout(fallbackTimer); silentAttemptInProgress=false; silentAttemptEmail=null; view='login'; render(); }
+  }
+}
 
 function loginWithGoogle(){
   if(CLIENT_ID.indexOf('PASTE_YOUR_CLIENT_ID_HERE') !== -1){
@@ -218,23 +256,32 @@ function loginWithGoogle(){
 function logoutFlow(){
   askPassword('Confirm Logout', ()=>{
     if(accessToken){ google.accounts.oauth2.revoke(accessToken, ()=>{}); }
+    try{ localStorage.removeItem(LAST_EMAIL_KEY); }catch(e){}
     accessToken=null; userEmail=null; currentEmployees=[]; resignedEmployees=[];
     view='login'; render();
     toast('Logged out.');
   });
 }
 
-async function afterLogin(){
+async function afterLogin(isSilent, expectedEmail){
   view='loading'; render('Verifying your Google account...');
   try{
     const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+accessToken } });
     const info = await res.json();
     if(!info.email || info.email.indexOf('@gmail.com') === -1){
+      if(isSilent){ accessToken = null; view='login'; render(); return; }
       toast('Please sign in with an @gmail.com account.', true);
       accessToken = null; view='login'; render();
       return;
     }
+    if(isSilent && expectedEmail && info.email !== expectedEmail){
+      // A different Google account is active on this device/browser than last time -
+      // don't silently switch accounts, require an explicit sign-in instead.
+      accessToken = null; view='login'; render();
+      return;
+    }
     userEmail = info.email;
+    try{ localStorage.setItem(LAST_EMAIL_KEY, userEmail); }catch(e){}
     view='loading'; render('Setting up Employee Record folders on Drive...');
     await setupDriveStructure();
     view='loading'; render('Loading employee records from Drive...');
@@ -242,6 +289,7 @@ async function afterLogin(){
     view='dashboard'; render();
   }catch(e){
     console.error(e);
+    if(isSilent){ accessToken = null; view='login'; render(); return; }
     toast('Something went wrong connecting to Google Drive.', true);
     view='login'; render();
   }
@@ -480,7 +528,7 @@ function renderLoading(msg){
 function renderLogin(){
   app.innerHTML = `
     <div id="login-screen">
-      <div class="eyebrow" style="text-align:center;">OPTP RESTAURANT // SECURE ACCESS</div>
+      <div class="eyebrow" style="text-align:center;">OPTP SCH III // SECURE ACCESS</div>
       <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
       <div class="panel login-box">
         <div class="stat-line" style="font-size:13px;margin-bottom:10px;">Sign in with an active Gmail account. Your data saves to <b style="color:var(--green)">your own Google Drive</b> in an "Employee Record" folder.</div>
@@ -498,7 +546,7 @@ function topbarHTML(){
   return `
   <div id="topbar">
     <div>
-      <div class="eyebrow">OPTP RESTAURANT</div>
+      <div class="eyebrow">OPTP SCH III</div>
       <h2 class="glow" style="font-size:18px;">Employee Record System</h2>
     </div>
     <div style="text-align:right;">
@@ -549,11 +597,11 @@ function formFieldsHTML(emp){
     </div>
     <div class="row">
       <div class="field"><label>Father Name</label><input id="f-fatherName" value="${g('fatherName')}"></div>
-      <div class="field"><label>CNIC Number</label><input id="f-cnic" placeholder="xxxxx-xxxxxxx-x" value="${g('cnic')}"></div>
+      <div class="field"><label>CNIC Number</label><input id="f-cnic" placeholder="xxxxx-xxxxxxx-x" maxlength="15" value="${g('cnic')}"></div>
     </div>
     <div class="row">
-      <div class="field"><label>Father CNIC Number</label><input id="f-fatherCnic" value="${g('fatherCnic')}"></div>
-      <div class="field"><label class="req">Date of Birth</label><input type="text" id="f-dob" placeholder="DD-MM-YYYY" value="${g('dob')}"></div>
+      <div class="field"><label>Father CNIC Number</label><input id="f-fatherCnic" placeholder="xxxxx-xxxxxxx-x" maxlength="15" value="${g('fatherCnic')}"></div>
+      <div class="field"><label class="req">Date of Birth</label><input type="date" id="f-dob" value="${g('dob')}"></div>
     </div>
     <div class="subhead">Qualification</div>
     <div class="field">
@@ -579,7 +627,7 @@ function formFieldsHTML(emp){
       <div class="field"><label>Salary</label><input type="number" id="f-salary" value="${g('salary')}"></div>
     </div>
     <div class="row">
-      <div class="field"><label class="req">Joining Date</label><input type="text" id="f-joiningDate" placeholder="DD-MM-YYYY" value="${g('joiningDate')}"></div>
+      <div class="field"><label class="req">Joining Date</label><input type="date" id="f-joiningDate" value="${g('joiningDate')}"></div>
       <div class="field">
         <label>Relationship Status</label>
         <div class="radio-group">
@@ -646,6 +694,23 @@ function formFieldsHTML(emp){
   `;
 }
 function wireFormInteractions(store){
+  function formatCNIC(raw){
+    const digits = raw.replace(/\D/g,'').slice(0,13);
+    if(digits.length > 12) return digits.slice(0,5) + '-' + digits.slice(5,12) + '-' + digits.slice(12);
+    if(digits.length > 5) return digits.slice(0,5) + '-' + digits.slice(5);
+    return digits;
+  }
+  function wireCnicField(id){
+    const el = document.getElementById(id);
+    el.setAttribute('inputmode','numeric');
+    el.addEventListener('input', ()=>{
+      const cursorWasAtEnd = el.selectionStart === el.value.length;
+      el.value = formatCNIC(el.value);
+      if(cursorWasAtEnd) el.setSelectionRange(el.value.length, el.value.length);
+    });
+  }
+  wireCnicField('f-cnic');
+  wireCnicField('f-fatherCnic');
   document.getElementById('f-qualification').addEventListener('change', e=>{
     document.getElementById('qual-detail-wrap').classList.toggle('hidden', e.target.value !== 'Graduation Continue');
   });
@@ -697,25 +762,13 @@ function collectFormData(existing){
   data.courses = val('f-courses'); data.skills = val('f-skills');
   return data;
 }
-function isValidDateStr(str){
-  const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec((str||'').trim());
-  if(!m) return false;
-  const day = parseInt(m[1],10), month = parseInt(m[2],10), year = parseInt(m[3],10);
-  if(month < 1 || month > 12) return false;
-  if(year < 1930 || year > 2100) return false;
-  const daysInMonth = new Date(year, month, 0).getDate();
-  if(day < 1 || day > daysInMonth) return false;
-  return true;
-}
 function validateForm(data){
   const missing = [];
   if(!data.position) missing.push('Position');
   if(!data.dob) missing.push('Date of Birth');
-  else if(!isValidDateStr(data.dob)) missing.push('Date of Birth (use format DD-MM-YYYY)');
   if(!data.qualification) missing.push('Qualification');
   if(data.qualification === 'Graduation Continue' && !data.qualificationDetail) missing.push('Qualification Detail');
   if(!data.joiningDate) missing.push('Joining Date');
-  else if(!isValidDateStr(data.joiningDate)) missing.push('Joining Date (use format DD-MM-YYYY)');
   if(!data.permanentAddress) missing.push('Permanent Address');
   if(!data.temporaryAddress) missing.push('Temporary Address');
   if(!data.previousExperience) missing.push('Previous Experience (Yes/No)');
@@ -1020,7 +1073,7 @@ function openResignDialog(emp){
           <label class="radio-opt"><input type="radio" name="exit-type" value="Retired"> Retired</label>
         </div>
       </div>
-      <div class="field"><label>Date</label><input type="text" id="exit-date" placeholder="DD-MM-YYYY"></div>
+      <div class="field"><label>Date</label><input type="date" id="exit-date"></div>
       <div class="field"><label>Note (optional)</label><textarea id="exit-note" rows="2"></textarea></div>
       <div style="display:flex;gap:10px;justify-content:flex-end;">
         <button class="btn cyan" id="exit-cancel">Cancel</button>
@@ -1033,7 +1086,6 @@ function openResignDialog(emp){
     const type = overlay.querySelector('input[name="exit-type"]:checked').value;
     const date = overlay.querySelector('#exit-date').value.trim();
     const note = overlay.querySelector('#exit-note').value.trim();
-    if(date && !isValidDateStr(date)){ toast('Date must be in DD-MM-YYYY format.', true); return; }
     const btn = overlay.querySelector('#exit-confirm');
     btn.disabled = true; btn.textContent = 'Moving...';
     try{
