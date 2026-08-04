@@ -168,7 +168,7 @@ let userEmail = null;
 let rootFolderId, currentFolderId, resignedFolderId;
 let currentEmployees = [];
 let resignedEmployees = [];
-let view = "login";
+let view = "pinlock";
 let searchQueryCurrent = "";
 let searchQueryResigned = "";
 
@@ -183,10 +183,34 @@ function toast(msg, isErr){
 }
 function uid(){ return 'EMP-' + Date.now() + '-' + Math.floor(Math.random()*9000+1000); }
 
-/* ============ GOOGLE SIGN-IN ============ */
-const LAST_EMAIL_KEY = 'optp_last_signed_in_email';
+/* ============ GOOGLE SIGN-IN ============
+   The raw access token is cached (with its expiry) in localStorage. On
+   reopening the app, if a still-valid cached token exists, it's reused
+   directly with no Google network round trip at all - so the login screen
+   is skipped instantly. Once that token expires (Google issues them for
+   about an hour), a best-effort silent renewal is tried; if that fails
+   (new device, different Google account, or no active browser session)
+   the normal login screen is shown, exactly as requested. ============ */
+const SESSION_KEY = 'optp_session_v1';
 let silentAttemptInProgress = false;
 let silentAttemptEmail = null;
+
+function saveSession(email, token, expiresInSeconds){
+  try{
+    const expiresAt = Date.now() + (Math.max(60, (expiresInSeconds || 3300) - 120)) * 1000;
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ email, token, expiresAt }));
+  }catch(e){}
+}
+function loadSession(){
+  try{
+    const raw = localStorage.getItem(SESSION_KEY);
+    if(!raw) return null;
+    return JSON.parse(raw);
+  }catch(e){ return null; }
+}
+function clearSession(){
+  try{ localStorage.removeItem(SESSION_KEY); }catch(e){}
+}
 
 function initGis(){
   if(CLIENT_ID.indexOf('PASTE_YOUR_CLIENT_ID_HERE') !== -1){
@@ -206,22 +230,34 @@ function initGis(){
         return;
       }
       accessToken = resp.access_token;
-      await afterLogin(wasSilent, expectedEmail);
+      await afterLogin(wasSilent, expectedEmail, resp.expires_in);
     }
   });
 }
 window.addEventListener('load', ()=>{
   const check = setInterval(()=>{
     if(window.google && google.accounts && google.accounts.oauth2){
-      clearInterval(check); initGis(); attemptAutoLogin();
+      clearInterval(check); initGis();
+      view='pinlock'; render();
     }
   }, 200);
 });
 
-function attemptAutoLogin(){
-  let savedEmail = null;
-  try{ savedEmail = localStorage.getItem(LAST_EMAIL_KEY); }catch(e){}
+async function attemptAutoLogin(){
+  const session = loadSession();
+
+  // 1) A still-valid cached token exists - use it directly, no Google call at all.
+  if(session && session.token && session.expiresAt > Date.now()){
+    view='loading'; render('Restoring your session...');
+    accessToken = session.token;
+    await afterLogin(true, session.email, null, /*skipUserinfoOnFail*/ true);
+    return;
+  }
+
+  // 2) No valid cached token - try a best-effort silent renewal if we know who was signed in.
+  const savedEmail = session ? session.email : null;
   if(!savedEmail){ view='login'; render(); return; }
+
   view='loading'; render('Restoring your session...');
   silentAttemptInProgress = true;
   silentAttemptEmail = savedEmail;
@@ -235,7 +271,6 @@ function attemptAutoLogin(){
     }
   }, 7000);
   const originalCallback = tokenClient.callback;
-  // wrap once so the fallback timer is always cleared once the real callback fires
   tokenClient.callback = (resp)=>{ settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; originalCallback(resp); };
   try{
     tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail });
@@ -256,19 +291,28 @@ function loginWithGoogle(){
 function logoutFlow(){
   askPassword('Confirm Logout', ()=>{
     if(accessToken){ google.accounts.oauth2.revoke(accessToken, ()=>{}); }
-    try{ localStorage.removeItem(LAST_EMAIL_KEY); }catch(e){}
+    clearSession();
     accessToken=null; userEmail=null; currentEmployees=[]; resignedEmployees=[];
     view='login'; render();
     toast('Logged out.');
   });
 }
 
-async function afterLogin(isSilent, expectedEmail){
+async function afterLogin(isSilent, expectedEmail, expiresInSeconds, isFromCache){
   view='loading'; render('Verifying your Google account...');
   try{
     const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers:{ Authorization:'Bearer '+accessToken } });
+    if(!res.ok){
+      // cached token is no longer valid server-side (e.g. revoked) - fall back cleanly
+      clearSession();
+      if(isSilent){ accessToken = null; view='login'; render(); return; }
+      toast('Session expired. Please sign in again.', true);
+      accessToken = null; view='login'; render();
+      return;
+    }
     const info = await res.json();
     if(!info.email || info.email.indexOf('@gmail.com') === -1){
+      clearSession();
       if(isSilent){ accessToken = null; view='login'; render(); return; }
       toast('Please sign in with an @gmail.com account.', true);
       accessToken = null; view='login'; render();
@@ -277,11 +321,12 @@ async function afterLogin(isSilent, expectedEmail){
     if(isSilent && expectedEmail && info.email !== expectedEmail){
       // A different Google account is active on this device/browser than last time -
       // don't silently switch accounts, require an explicit sign-in instead.
+      clearSession();
       accessToken = null; view='login'; render();
       return;
     }
     userEmail = info.email;
-    try{ localStorage.setItem(LAST_EMAIL_KEY, userEmail); }catch(e){}
+    if(!isFromCache){ saveSession(userEmail, accessToken, expiresInSeconds); }
     view='loading'; render('Setting up Employee Record folders on Drive...');
     await setupDriveStructure();
     view='loading'; render('Loading employee records from Drive...');
@@ -296,12 +341,37 @@ async function afterLogin(isSilent, expectedEmail){
 }
 
 /* ============ DRIVE API HELPERS ============ */
-async function driveFetch(url, options){
+function silentRefreshToken(){
+  return new Promise((resolve)=>{
+    if(!tokenClient || !userEmail){ resolve(false); return; }
+    let settled = false;
+    const fallbackTimer = setTimeout(()=>{ if(!settled){ settled = true; resolve(false); } }, 6000);
+    const originalCallback = tokenClient.callback;
+    tokenClient.callback = (resp)=>{
+      settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback;
+      if(resp.error){ resolve(false); return; }
+      accessToken = resp.access_token;
+      saveSession(userEmail, accessToken, resp.expires_in);
+      resolve(true);
+    };
+    try{
+      tokenClient.requestAccessToken({ prompt: 'none', hint: userEmail });
+    }catch(e){
+      if(!settled){ settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; resolve(false); }
+    }
+  });
+}
+async function driveFetch(url, options, _isRetry){
   options = options || {};
   options.headers = Object.assign({}, options.headers, { Authorization: 'Bearer ' + accessToken });
   const res = await fetch(url, options);
   if(res.status === 401){
-    toast('Session expired. Please login again.', true);
+    if(!_isRetry){
+      const refreshed = await silentRefreshToken();
+      if(refreshed) return driveFetch(url, options, true);
+    }
+    clearSession();
+    toast('Session expired. Please sign in again.', true);
     accessToken = null; view='login'; render();
     throw new Error('401 Unauthorized');
   }
@@ -524,6 +594,37 @@ function renderLoading(msg){
     </div>`;
 }
 
+/* ============ RENDER: PIN LOCK ============
+   Shown every time the app is opened, before anything else (before Google
+   sign-in and before the dashboard). ============ */
+function renderPinLock(){
+  app.innerHTML = `
+    <div id="login-screen">
+      <div class="eyebrow" style="text-align:center;">OPTP SCH III // SECURE ACCESS</div>
+      <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
+      <div class="panel login-box">
+        <div class="stat-line" style="font-size:13px;margin-bottom:14px;">Enter the app password to continue.</div>
+        <div class="field" style="text-align:left;">
+          <input type="password" id="pinlock-input" placeholder="Enter password" autocomplete="off">
+        </div>
+        <div id="pinlock-err" style="color:var(--red);font-size:11.5px;min-height:16px;margin:6px 0 4px;"></div>
+        <button class="btn" id="pinlock-btn" style="width:100%;margin-top:8px;">Unlock</button>
+      </div>
+    </div>`;
+  const input = document.getElementById('pinlock-input');
+  input.focus();
+  function tryUnlock(){
+    if(input.value === APP_PASSWORD){
+      attemptAutoLogin();
+    } else {
+      document.getElementById('pinlock-err').textContent = 'Incorrect password.';
+      input.value=''; input.focus();
+    }
+  }
+  document.getElementById('pinlock-btn').onclick = tryUnlock;
+  input.addEventListener('keydown', e=>{ if(e.key==='Enter') tryUnlock(); });
+}
+
 /* ============ RENDER: LOGIN ============ */
 function renderLogin(){
   app.innerHTML = `
@@ -535,7 +636,6 @@ function renderLogin(){
         <div class="gsi-btn-wrap">
           <button class="btn" id="google-login-btn" style="padding:12px 26px;">Sign in with Google</button>
         </div>
-        <div class="stat-line" style="margin-top:18px;">After signing in you'll also be asked for the app password to unlock actions like edit / delete.</div>
       </div>
     </div>`;
   document.getElementById('google-login-btn').onclick = loginWithGoogle;
@@ -581,7 +681,7 @@ function renderDashboard(){
   </div>`;
   wireTopbar();
   document.getElementById('card-current').onclick = ()=>{ view='current'; render(); };
-  document.getElementById('card-new').onclick = ()=>{ view='new'; render(); };
+  document.getElementById('card-new').onclick = ()=> askPassword('Enter password to add a new employee', ()=>{ view='new'; render(); });
   document.getElementById('card-resigned').onclick = ()=>{ view='resigned'; render(); };
 }
 
@@ -711,6 +811,24 @@ function wireFormInteractions(store){
   }
   wireCnicField('f-cnic');
   wireCnicField('f-fatherCnic');
+  function wireDatePicker(id){
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('click', ()=>{ try{ el.showPicker(); }catch(e){} });
+  }
+  wireDatePicker('f-dob');
+  wireDatePicker('f-joiningDate');
+  function wireDatePicker(id){
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('click', ()=>{
+      if(typeof el.showPicker === 'function'){
+        try{ el.showPicker(); }catch(e){}
+      }
+    });
+  }
+  wireDatePicker('f-dob');
+  wireDatePicker('f-joiningDate');
   document.getElementById('f-qualification').addEventListener('change', e=>{
     document.getElementById('qual-detail-wrap').classList.toggle('hidden', e.target.value !== 'Graduation Continue');
   });
@@ -1082,6 +1200,10 @@ function openResignDialog(emp){
     </div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('#exit-cancel').onclick = ()=> overlay.remove();
+  const exitDateEl = overlay.querySelector('#exit-date');
+  exitDateEl.addEventListener('click', ()=>{
+    if(typeof exitDateEl.showPicker === 'function'){ try{ exitDateEl.showPicker(); }catch(e){} }
+  });
   overlay.querySelector('#exit-confirm').onclick = async ()=>{
     const type = overlay.querySelector('input[name="exit-type"]:checked').value;
     const date = overlay.querySelector('#exit-date').value.trim();
@@ -1142,7 +1264,8 @@ function openEditForm(emp, source){
 
 /* ============ MASTER RENDER ============ */
 function render(loadingMsg){
-  if(view==='login') renderLogin();
+  if(view==='pinlock') renderPinLock();
+  else if(view==='login') renderLogin();
   else if(view==='loading') renderLoading(loadingMsg);
   else if(view==='dashboard') renderDashboard();
   else if(view==='new') renderNewEmployee();
