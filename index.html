@@ -553,7 +553,7 @@ function formFieldsHTML(emp){
     </div>
     <div class="row">
       <div class="field"><label>Father CNIC Number</label><input id="f-fatherCnic" value="${g('fatherCnic')}"></div>
-      <div class="field"><label class="req">Date of Birth</label><input type="date" id="f-dob" value="${g('dob')}"></div>
+      <div class="field"><label class="req">Date of Birth</label><input type="text" id="f-dob" placeholder="DD-MM-YYYY" value="${g('dob')}"></div>
     </div>
     <div class="subhead">Qualification</div>
     <div class="field">
@@ -579,7 +579,7 @@ function formFieldsHTML(emp){
       <div class="field"><label>Salary</label><input type="number" id="f-salary" value="${g('salary')}"></div>
     </div>
     <div class="row">
-      <div class="field"><label class="req">Joining Date</label><input type="date" id="f-joiningDate" value="${g('joiningDate')}"></div>
+      <div class="field"><label class="req">Joining Date</label><input type="text" id="f-joiningDate" placeholder="DD-MM-YYYY" value="${g('joiningDate')}"></div>
       <div class="field">
         <label>Relationship Status</label>
         <div class="radio-group">
@@ -697,13 +697,25 @@ function collectFormData(existing){
   data.courses = val('f-courses'); data.skills = val('f-skills');
   return data;
 }
+function isValidDateStr(str){
+  const m = /^(\d{2})-(\d{2})-(\d{4})$/.exec((str||'').trim());
+  if(!m) return false;
+  const day = parseInt(m[1],10), month = parseInt(m[2],10), year = parseInt(m[3],10);
+  if(month < 1 || month > 12) return false;
+  if(year < 1930 || year > 2100) return false;
+  const daysInMonth = new Date(year, month, 0).getDate();
+  if(day < 1 || day > daysInMonth) return false;
+  return true;
+}
 function validateForm(data){
   const missing = [];
   if(!data.position) missing.push('Position');
   if(!data.dob) missing.push('Date of Birth');
+  else if(!isValidDateStr(data.dob)) missing.push('Date of Birth (use format DD-MM-YYYY)');
   if(!data.qualification) missing.push('Qualification');
   if(data.qualification === 'Graduation Continue' && !data.qualificationDetail) missing.push('Qualification Detail');
   if(!data.joiningDate) missing.push('Joining Date');
+  else if(!isValidDateStr(data.joiningDate)) missing.push('Joining Date (use format DD-MM-YYYY)');
   if(!data.permanentAddress) missing.push('Permanent Address');
   if(!data.temporaryAddress) missing.push('Temporary Address');
   if(!data.previousExperience) missing.push('Previous Experience (Yes/No)');
@@ -889,8 +901,7 @@ function buildPrintableHTML(emp){
   </style></head>
   <body>
     <div class="phead">
-      <div><h1>OPTP Restaurant</h1><div class="sub">Employee Record</div></div>
-      <div class="sub">Generated: ${today}</div>
+      <div><h1>OPTP Sch III</h1><div class="sub">Employee Record</div></div>
     </div>
     <div class="ptop">
       ${emp.picture ? `<img class="photo" src="${emp.picture}">` : ''}
@@ -904,7 +915,7 @@ function buildPrintableHTML(emp){
       ${emp.cnicFront ? `<div><img src="${emp.cnicFront}"><div class="dlbl">CNIC Front</div></div>` : ''}
       ${emp.cnicBack ? `<div><img src="${emp.cnicBack}"><div class="dlbl">CNIC Back</div></div>` : ''}
     </div>
-    <div class="pfooter">OPTP Restaurant &mdash; Confidential Employee Record. Not for external distribution.</div>
+    <div class="pfooter">OPTP Sch III &mdash; Confidential Employee Record. Only for Office Use.</div>
   </body></html>`;
 }
 function openPrintableRecord(emp){
@@ -1009,7 +1020,7 @@ function openResignDialog(emp){
           <label class="radio-opt"><input type="radio" name="exit-type" value="Retired"> Retired</label>
         </div>
       </div>
-      <div class="field"><label>Date</label><input type="date" id="exit-date"></div>
+      <div class="field"><label>Date</label><input type="text" id="exit-date" placeholder="DD-MM-YYYY"></div>
       <div class="field"><label>Note (optional)</label><textarea id="exit-note" rows="2"></textarea></div>
       <div style="display:flex;gap:10px;justify-content:flex-end;">
         <button class="btn cyan" id="exit-cancel">Cancel</button>
@@ -1020,8 +1031,9 @@ function openResignDialog(emp){
   overlay.querySelector('#exit-cancel').onclick = ()=> overlay.remove();
   overlay.querySelector('#exit-confirm').onclick = async ()=>{
     const type = overlay.querySelector('input[name="exit-type"]:checked').value;
-    const date = overlay.querySelector('#exit-date').value;
+    const date = overlay.querySelector('#exit-date').value.trim();
     const note = overlay.querySelector('#exit-note').value.trim();
+    if(date && !isValidDateStr(date)){ toast('Date must be in DD-MM-YYYY format.', true); return; }
     const btn = overlay.querySelector('#exit-confirm');
     btn.disabled = true; btn.textContent = 'Moving...';
     try{
