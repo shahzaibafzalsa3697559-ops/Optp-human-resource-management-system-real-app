@@ -398,25 +398,32 @@ function silentRefreshToken() {
 
 async function driveFetch(url, options, _isRetry) {
   options = options || {};
-  options.headers = Object.assign({}, options.headers, { Authorization: 'Bearer ' + accessToken });
-  const res = await fetch(url, options);
+  const headers = Object.assign({}, options.headers || {}, {
+    Authorization: 'Bearer ' + accessToken
+  });
+  const requestOptions = Object.assign({}, options, { headers });
+  const res = await fetch(url, requestOptions);
+
   if (res.status === 401) {
     if (!_isRetry) {
       const refreshed = await silentRefreshToken();
       if (refreshed) return driveFetch(url, options, true);
     }
     clearSession();
-    toast('Session expired. Please sign in again.', true);
     accessToken = null;
+    userEmail = null;
+    currentEmployees = [];
+    resignedEmployees = [];
     view = 'login';
     render();
     throw new Error('401 Unauthorized');
   }
+
   if (!res.ok) {
     let detail = '';
     try {
       const errJson = await res.clone().json();
-      detail = errJson?.error?.message || '';
+      detail = errJson?.error?.message || errJson?.error?.status || '';
     } catch(e) {}
     throw new Error('Drive API status ' + res.status + (detail ? ': ' + detail : ''));
   }
@@ -425,8 +432,12 @@ async function driveFetch(url, options, _isRetry) {
 
 async function findFolder(name, parentId) {
   const safe = name.replace(/'/g, "\\'");
-  const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${safe}' and '${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
+  const q = encodeURIComponent(
+    `mimeType='application/vnd.google-apps.folder' and name='${safe}' and '${parentId}' in parents and trashed=false`
+  );
+  const res = await driveFetch(
+    `https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=100`
+  );
   const data = await res.json();
   return (data.files && data.files.length) ? data.files[0].id : null;
 }
@@ -499,18 +510,37 @@ async function trashFolder(folderId) {
   });
 }
 
+async function listAllDriveFiles(q, fields) {
+  const all = [];
+  let pageToken = '';
+  do {
+    const params = new URLSearchParams({
+      q,
+      fields: 'nextPageToken,files(' + fields + ')',
+      pageSize: '1000',
+      orderBy: 'name_natural'
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+    const res = await driveFetch('https://www.googleapis.com/drive/v3/files?' + params.toString());
+    const data = await res.json();
+    if (Array.isArray(data.files)) all.push(...data.files);
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+  return all;
+}
+
 async function listChildFolders(parentId) {
-  const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1000`);
-  const data = await res.json();
-  return data.files || [];
+  return listAllDriveFiles(
+    `mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`,
+    'id,name'
+  );
 }
 
 async function listChildFiles(parentId) {
-  const q = encodeURIComponent(`'${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType)&pageSize=100`);
-  const data = await res.json();
-  return data.files || [];
+  return listAllDriveFiles(
+    `'${parentId}' in parents and trashed=false`,
+    'id,name,mimeType'
+  );
 }
 
 async function getFileText(fileId) {
@@ -838,17 +868,17 @@ function formFieldsHTML(emp) {
       <div class="field">
         <label class="req">Upload Picture</label>
         <div class="upload-box" id="pic-box">Click to select photo<br><img class="upload-preview ${raw('picture') ? '' : 'hidden'}" id="pic-preview" src="${raw('picture') || ''}"></div>
-        <input type="file" accept="image/*" id="f-picture" class="hidden">
+        <input type="file" accept="image/*" capture="user" id="f-picture" class="hidden">
       </div>
       <div class="field">
         <label class="req">CNIC Front Side</label>
         <div class="upload-box" id="cnicf-box">Click to select file<br><img class="upload-preview ${raw('cnicFront') ? '' : 'hidden'}" id="cnicf-preview" src="${raw('cnicFront') || ''}"></div>
-        <input type="file" accept="image/*" id="f-cnicFront" class="hidden">
+        <input type="file" accept="image/*" capture="environment" id="f-cnicFront" class="hidden">
       </div>
       <div class="field">
         <label class="req">CNIC Back Side</label>
         <div class="upload-box" id="cnicb-box">Click to select file<br><img class="upload-preview ${raw('cnicBack') ? '' : 'hidden'}" id="cnicb-preview" src="${raw('cnicBack') || ''}"></div>
-        <input type="file" accept="image/*" id="f-cnicBack" class="hidden">
+        <input type="file" accept="image/*" capture="environment" id="f-cnicBack" class="hidden">
       </div>
     </div>
   `;
@@ -1378,6 +1408,14 @@ function openEditForm(emp, source) {
     }
   };
 }
+
+window.addEventListener('error', (event) => {
+  console.error('Unhandled application error:', event.error || event.message);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled promise rejection:', event.reason);
+});
 
 function render(loadingMsg) {
   if (view === 'pinlock') renderPinLock();
