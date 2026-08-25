@@ -1,25 +1,160 @@
+const CONFIG = Object.freeze({
+  CLIENT_ID: "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com",
+  SCOPES: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email",
+  PIN_HASH: "75c35b8006bf5aa6cc4a6ff417646da909c00b0f498c8052cf7fc06bf639dd75",
+  AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com"],
+  SESSION_STORAGE_KEY: "optp_active_session"
+});
 
-const CLIENT_ID = "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com";
-const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
-const APP_PASSWORD = "6666";
-const SESSION_KEY = "optp_session_v1";
+const Storage = {
+  token: null,
 
-let accessToken = null;
+  setToken(val) {
+    this.token = val;
+  },
+
+  async request(url, options = {}) {
+    options.headers = Object.assign({}, options.headers || {}, {
+      Authorization: `Bearer ${this.token}`
+    });
+
+    const res = await fetch(url, options);
+
+    if (res.status === 401) {
+      throw new Error('UNAUTHORIZED');
+    }
+
+    if (!res.ok) {
+      let message = '';
+      try {
+        const err = await res.json();
+        message = err?.error?.message || '';
+      } catch (e) {}
+      throw new Error(message || `Drive request error: ${res.status}`);
+    }
+
+    return res;
+  },
+
+  async getFolderId(name, parentId = 'root') {
+    const safe = name.replace(/'/g, "\\'");
+    const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${safe}' and '${parentId}' in parents and trashed=false`);
+    const res = await this.request(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=10`);
+    const data = await res.json();
+    return data.files?.[0]?.id || null;
+  },
+
+  async createFolder(name, parentId = 'root') {
+    const res = await this.request('https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [parentId]
+      })
+    });
+    const data = await res.json();
+    return data.id;
+  },
+
+  async resolveFolder(name, parentId = 'root') {
+    let id = await this.getFolderId(name, parentId);
+    if (!id) id = await this.createFolder(name, parentId);
+    return id;
+  },
+
+  async uploadFile(name, mimeType, parentId, payload, isText = false) {
+    const metaRes = await this.request('https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, parents: [parentId] })
+    });
+    const meta = await metaRes.json();
+    const fileId = meta.id;
+    const body = isText ? payload : await (await fetch(payload)).blob();
+
+    await this.request(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': mimeType },
+      body
+    });
+
+    return fileId;
+  },
+
+  async patchFile(fileId, mimeType, payload, isText = false) {
+    const body = isText ? payload : await (await fetch(payload)).blob();
+    await this.request(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': mimeType },
+      body
+    });
+  },
+
+  async setFileName(fileId, newName) {
+    await this.request(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName })
+    });
+  },
+
+  async relocateFolder(folderId, fromParent, toParent) {
+    await this.request(`https://www.googleapis.com/drive/v3/files/${folderId}?addParents=${toParent}&removeParents=${fromParent}`, {
+      method: 'PATCH'
+    });
+  },
+
+  async trashEntry(folderId) {
+    await this.request(`https://www.googleapis.com/drive/v3/files/${folderId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trashed: true })
+    });
+  },
+
+  async fetchChildren(parentId) {
+    const q = encodeURIComponent(`'${parentId}' in parents and trashed=false`);
+    const res = await this.request(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType)&pageSize=1000`);
+    const data = await res.json();
+    return data.files || [];
+  },
+
+  async readTextFile(fileId) {
+    const res = await this.request(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+    return res.text();
+  },
+
+  async readBase64(fileId) {
+    if (!fileId) return '';
+    const res = await this.request(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
+    const blob = await res.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+};
+
 let tokenClient = null;
-let userEmail = null;
-let rootFolderId, currentFolderId, resignedFolderId;
-let currentEmployees = [];
-let resignedEmployees = [];
-let view = "pinlock";
-let searchQueryCurrent = "";
-let searchQueryResigned = "";
-let silentAttemptInProgress = false;
-let silentAttemptEmail = null;
+let currentSessionUser = null;
+let folderRootId = null, folderActiveId = null, folderArchiveId = null;
+let activeEmployees = [];
+let archivedEmployees = [];
+let currentScreen = "pinlock";
+let filterCurrentQuery = "";
+let filterArchiveQuery = "";
+let invalidPinCounter = 0;
+let lockoutExpiryTimestamp = 0;
+let isSilentRefreshActive = false;
 
-const app = document.getElementById('app');
+const root = document.getElementById('root');
 
-function esc(str) {
-  return String(str == null ? '' : str)
+function sanitize(input) {
+  return String(input == null ? '' : input)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -27,484 +162,66 @@ function esc(str) {
     .replace(/'/g, '&#039;');
 }
 
-function toast(msg, isErr) {
-  const t = document.createElement('div');
-  t.className = 'toast' + (isErr ? ' err' : '');
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+function showNotification(message, isError = false) {
+  const node = document.createElement('div');
+  node.className = 'alert-toast' + (isError ? ' error' : '');
+  node.textContent = message;
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), 3200);
 }
 
-function uid() {
+function generateId() {
   return 'EMP-' + Date.now() + '-' + Math.floor(Math.random() * 9000 + 1000);
 }
 
-function saveSession(email, token, expiresInSeconds) {
-  try {
-    const expiresAt = Date.now() + (Math.max(60, (expiresInSeconds || 3300) - 120)) * 1000;
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ email, token, expiresAt }));
-  } catch(e) {}
+async function computeSha256(text) {
+  const buffer = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function loadSession() {
+function persistSession(email, token, expSec) {
   try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch(e) {
+    const expiresAt = Date.now() + (Math.max(60, (expSec || 3300) - 120)) * 1000;
+    sessionStorage.setItem(CONFIG.SESSION_STORAGE_KEY, JSON.stringify({ email, token, expiresAt }));
+  } catch (e) {}
+}
+
+function getStoredSession() {
+  try {
+    const str = sessionStorage.getItem(CONFIG.SESSION_STORAGE_KEY);
+    return str ? JSON.parse(str) : null;
+  } catch (e) {
     return null;
   }
 }
 
-function clearSession() {
-  try { localStorage.removeItem(SESSION_KEY); } catch(e) {}
+function purgeSession() {
+  try { sessionStorage.removeItem(CONFIG.SESSION_STORAGE_KEY); } catch (e) {}
 }
 
-function initGis() {
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID,
-    scope: SCOPES,
-    callback: async (resp) => {
-      const wasSilent = silentAttemptInProgress;
-      const expectedEmail = silentAttemptEmail;
-      silentAttemptInProgress = false;
-      silentAttemptEmail = null;
-      if (resp.error) {
-        if (wasSilent) { view = 'login'; render(); return; }
-        toast('Login failed: ' + resp.error, true);
-        view = 'login';
-        render();
-        return;
-      }
-      accessToken = resp.access_token;
-      await afterLogin(wasSilent, expectedEmail, resp.expires_in);
-    }
-  });
+function isEmailAuthorized(email) {
+  if (!CONFIG.AUTHORIZED_EMAILS.length) return true;
+  const target = String(email || '').trim().toLowerCase();
+  return CONFIG.AUTHORIZED_EMAILS.some(item => String(item).trim().toLowerCase() === target);
 }
 
-window.addEventListener('load', () => {
-  const check = setInterval(() => {
-    if (window.google && google.accounts && google.accounts.oauth2) {
-      clearInterval(check);
-      initGis();
-      view = 'pinlock';
-      render();
-    }
-  }, 100);
-});
-
-async function attemptAutoLogin() {
-  const session = loadSession();
-
-  // 1. Agar cached token abhi valid hai to direct use karein
-  if (session && session.token && session.expiresAt > Date.now()) {
-    view = 'loading';
-    render('Restoring your session...');
-    accessToken = session.token;
-    await afterLogin(true, session.email, null, true);
-    return;
-  }
-
-  // 2. Agar token expire ho gaya hai to background mein silent refresh karein
-  const savedEmail = session ? session.email : null;
-  if (!savedEmail) {
-    view = 'login';
-    render();
-    return;
-  }
-
-  view = 'loading';
-  render('Restoring your session...');
-  silentAttemptInProgress = true;
-  silentAttemptEmail = savedEmail;
-  let settled = false;
-
-  const fallbackTimer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      silentAttemptInProgress = false;
-      silentAttemptEmail = null;
-      view = 'login';
-      render();
-    }
-  }, 6000);
-
-  const originalCallback = tokenClient.callback;
-  tokenClient.callback = (resp) => {
-    settled = true;
-    clearTimeout(fallbackTimer);
-    tokenClient.callback = originalCallback;
-    originalCallback(resp);
-  };
-
-  try {
-    tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail });
-  } catch(e) {
-    if (!settled) {
-      settled = true;
-      clearTimeout(fallbackTimer);
-      silentAttemptInProgress = false;
-      silentAttemptEmail = null;
-      view = 'login';
-      render();
-    }
-  }
-}
-
-function loginWithGoogle() {
-  if (!tokenClient) {
-    toast('Authentication service loading...', true);
-    return;
-  }
-  tokenClient.requestAccessToken({ prompt: 'consent' });
-}
-
-function logoutFlow() {
-  askPassword('Confirm Logout', () => {
-    if (accessToken) {
-      google.accounts.oauth2.revoke(accessToken, () => {});
-    }
-    clearSession();
-    accessToken = null;
-    userEmail = null;
-    currentEmployees = [];
-    resignedEmployees = [];
-    view = 'login';
-    render();
-    toast('Logged out.');
-  });
-}
-
-async function afterLogin(isSilent, expectedEmail, expiresInSeconds, isFromCache) {
-  view = 'loading';
-  render('Verifying Google Account...');
-  try {
-    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: 'Bearer ' + accessToken }
-    });
-    if (!res.ok) {
-      clearSession();
-      accessToken = null;
-      view = 'login';
-      render();
-      if (!isSilent) toast('Session expired. Please sign in again.', true);
-      return;
-    }
-    const info = await res.json();
-    if (isSilent && expectedEmail && info.email !== expectedEmail) {
-      clearSession();
-      accessToken = null;
-      view = 'login';
-      render();
-      return;
-    }
-    userEmail = info.email;
-    if (!isFromCache) saveSession(userEmail, accessToken, expiresInSeconds);
-    
-    view = 'loading';
-    render('Configuring Storage Folders...');
-    await setupDriveStructure();
-    
-    view = 'loading';
-    render('Loading employee records...');
-    await loadAllFromDrive();
-    
-    view = 'dashboard';
-    render();
-  } catch(e) {
-    if (isSilent) {
-      accessToken = null;
-      view = 'login';
-      render();
-      return;
-    }
-    toast('Error connecting to Google Drive.', true);
-    view = 'login';
-    render();
-  }
-}
-
-function silentRefreshToken() {
-  return new Promise((resolve) => {
-    if (!tokenClient || !userEmail) { resolve(false); return; }
-    let settled = false;
-    const fallbackTimer = setTimeout(() => { if (!settled) { settled = true; resolve(false); } }, 6000);
-    const originalCallback = tokenClient.callback;
-    tokenClient.callback = (resp) => {
-      settled = true;
-      clearTimeout(fallbackTimer);
-      tokenClient.callback = originalCallback;
-      if (resp.error) { resolve(false); return; }
-      accessToken = resp.access_token;
-      saveSession(userEmail, accessToken, resp.expires_in);
-      resolve(true);
-    };
-    try {
-      tokenClient.requestAccessToken({ prompt: 'none', hint: userEmail });
-    } catch(e) {
-      if (!settled) {
-        settled = true;
-        clearTimeout(fallbackTimer);
-        tokenClient.callback = originalCallback;
-        resolve(false);
-      }
-    }
-  });
-}
-
-async function driveFetch(url, options = {}, _isRetry) {
-  options.headers = Object.assign({}, options.headers || {}, {
-    Authorization: 'Bearer ' + accessToken
-  });
-  const res = await fetch(url, options);
-  if (res.status === 401) {
-    if (!_isRetry) {
-      const refreshed = await silentRefreshToken();
-      if (refreshed) return driveFetch(url, options, true);
-    }
-    clearSession();
-    accessToken = null;
-    view = 'login';
-    render();
-    throw new Error('401 Unauthorized');
-  }
-  if (!res.ok) {
-    let detail = '';
-    try { const errJson = await res.clone().json(); detail = errJson?.error?.message || ''; } catch(e) {}
-    throw new Error('Drive API error ' + res.status + (detail ? ': ' + detail : ''));
-  }
-  return res;
-}
-
-async function findFolder(name, parentId) {
-  const safe = name.replace(/'/g, "\\'");
-  const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${safe}' and '${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=10`);
-  const data = await res.json();
-  return (data.files && data.files.length) ? data.files[0].id : null;
-}
-
-async function createFolder(name, parentId) {
-  const res = await driveFetch('https://www.googleapis.com/drive/v3/files', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] })
-  });
-  const data = await res.json();
-  return data.id;
-}
-
-async function findOrCreateFolder(name, parentId) {
-  let id = await findFolder(name, parentId);
-  if (!id) id = await createFolder(name, parentId);
-  return id;
-}
-
-async function setupDriveStructure() {
-  rootFolderId = await findOrCreateFolder('OPTP Employee Record', 'root');
-  currentFolderId = await findOrCreateFolder('Current Employees', rootFolderId);
-  resignedFolderId = await findOrCreateFolder('Resigned or Retired Employees', rootFolderId);
-}
-
-async function createFileWithContent(name, mimeType, parentId, content, isText) {
-  const metaRes = await driveFetch('https://www.googleapis.com/drive/v3/files', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, parents: [parentId] })
-  });
-  const meta = await metaRes.json();
-  const fileId = meta.id;
-  const body = isText ? content : await (await fetch(content)).blob();
-  await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': mimeType },
-    body
-  });
-  return fileId;
-}
-
-async function updateFileContent(fileId, mimeType, content, isText) {
-  const body = isText ? content : await (await fetch(content)).blob();
-  await driveFetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': mimeType },
-    body
-  });
-}
-
-async function renameFile(fileId, newName) {
-  await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: newName })
-  });
-}
-
-async function moveFolder(folderId, fromParent, toParent) {
-  await driveFetch(`https://www.googleapis.com/drive/v3/files/${folderId}?addParents=${toParent}&removeParents=${fromParent}`, { method: 'PATCH' });
-}
-
-async function trashFolder(folderId) {
-  await driveFetch(`https://www.googleapis.com/drive/v3/files/${folderId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ trashed: true })
-  });
-}
-
-async function listChildFolders(parentId) {
-  const q = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&pageSize=1000`);
-  const data = await res.json();
-  return data.files || [];
-}
-
-async function listChildFiles(parentId) {
-  const q = encodeURIComponent(`'${parentId}' in parents and trashed=false`);
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType)&pageSize=100`);
-  const data = await res.json();
-  return data.files || [];
-}
-
-async function getFileText(fileId) {
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
-  return res.text();
-}
-
-async function getFileDataUrl(fileId) {
-  if (!fileId) return '';
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
-  const blob = await res.blob();
-  return new Promise(resolve => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function loadEmployeesFromFolder(parentId) {
-  const folders = await listChildFolders(parentId);
-  return Promise.all(folders.map(async (folder) => {
-    const children = await listChildFiles(folder.id);
-    const profileFile = children.find(f => f.name === 'profile.json');
-    const pictureFile = children.find(f => f.name === 'picture.jpg');
-    const cnicFrontFile = children.find(f => f.name === 'cnic_front.jpg');
-    const cnicBackFile = children.find(f => f.name === 'cnic_back.jpg');
-
-    let data = {};
-    if (profileFile) {
-      try { data = JSON.parse(await getFileText(profileFile.id)); } catch(e) {}
-    }
-    data.folderId = folder.id;
-    data.profileFileId = profileFile ? profileFile.id : null;
-    data.pictureFileId = pictureFile ? pictureFile.id : null;
-    data.cnicFrontFileId = cnicFrontFile ? cnicFrontFile.id : null;
-    data.cnicBackFileId = cnicBackFile ? cnicBackFile.id : null;
-
-    if (pictureFile) {
-      try { data.picture = await getFileDataUrl(pictureFile.id); } catch(e) {}
-    }
-    if (!data.id) data.id = folder.id;
-    return data;
-  }));
-}
-
-async function loadAllFromDrive() {
-  currentEmployees = await loadEmployeesFromFolder(currentFolderId);
-  resignedEmployees = await loadEmployeesFromFolder(resignedFolderId);
-}
-
-async function loadAssetsForDetail(emp) {
-  if (emp.pictureFileId && !emp.picture) {
-    try { emp.picture = await getFileDataUrl(emp.pictureFileId); } catch(e) {}
-  }
-  if (emp.cnicFrontFileId && !emp.cnicFront) {
-    try { emp.cnicFront = await getFileDataUrl(emp.cnicFrontFileId); } catch(e) {}
-  }
-  if (emp.cnicBackFileId && !emp.cnicBack) {
-    try { emp.cnicBack = await getFileDataUrl(emp.cnicBackFileId); } catch(e) {}
-  }
-  return emp;
-}
-
-function folderNameFor(data) {
-  return (data.fullName || 'Unnamed') + ' - ' + (data.cnic || data.id);
-}
-
-function profileCopyOf(data) {
-  const c = Object.assign({}, data);
-  delete c.picture; delete c.cnicFront; delete c.cnicBack;
-  delete c._pictureChanged; delete c._cnicFrontChanged; delete c._cnicBackChanged;
-  return c;
-}
-
-async function createEmployeeInDrive(data) {
-  const folderId = await createFolder(folderNameFor(data), currentFolderId);
-  data.folderId = folderId;
-  data.profileFileId = await createFileWithContent('profile.json', 'application/json', folderId, JSON.stringify(profileCopyOf(data)), true);
-  if (data.picture) data.pictureFileId = await createFileWithContent('picture.jpg', 'image/jpeg', folderId, data.picture, false);
-  if (data.cnicFront) data.cnicFrontFileId = await createFileWithContent('cnic_front.jpg', 'image/jpeg', folderId, data.cnicFront, false);
-  if (data.cnicBack) data.cnicBackFileId = await createFileWithContent('cnic_back.jpg', 'image/jpeg', folderId, data.cnicBack, false);
-  return data;
-}
-
-async function updateEmployeeInDrive(data) {
-  await renameFile(data.folderId, folderNameFor(data));
-  if (data.profileFileId) await updateFileContent(data.profileFileId, 'application/json', JSON.stringify(profileCopyOf(data)), true);
-  else data.profileFileId = await createFileWithContent('profile.json', 'application/json', data.folderId, JSON.stringify(profileCopyOf(data)), true);
-
-  if (data._pictureChanged && data.picture) {
-    if (data.pictureFileId) await updateFileContent(data.pictureFileId, 'image/jpeg', data.picture, false);
-    else data.pictureFileId = await createFileWithContent('picture.jpg', 'image/jpeg', data.folderId, data.picture, false);
-  }
-  if (data._cnicFrontChanged && data.cnicFront) {
-    if (data.cnicFrontFileId) await updateFileContent(data.cnicFrontFileId, 'image/jpeg', data.cnicFront, false);
-    else data.cnicFrontFileId = await createFileWithContent('cnic_front.jpg', 'image/jpeg', data.folderId, data.cnicFront, false);
-  }
-  if (data._cnicBackChanged && data.cnicBack) {
-    if (data.cnicBackFileId) await updateFileContent(data.cnicBackFileId, 'image/jpeg', data.cnicBack, false);
-    else data.cnicBackFileId = await createFileWithContent('cnic_back.jpg', 'image/jpeg', data.folderId, data.cnicBack, false);
-  }
-  delete data._pictureChanged; delete data._cnicFrontChanged; delete data._cnicBackChanged;
-}
-
-function askPassword(actionLabel, onSuccess) {
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="panel pw-modal-box">
-      <div class="eyebrow">SECURITY CHECK</div>
-      <h3 class="glow" style="margin:8px 0 16px;font-size:16px;">${esc(actionLabel)}</h3>
-      <div class="field"><input type="password" id="pw-input" placeholder="Enter password" autocomplete="off"></div>
-      <div id="pw-err" style="color:var(--danger);font-size:11px;min-height:14px;margin-bottom:10px;"></div>
-      <div style="display:flex;gap:10px;justify-content:center;">
-        <button class="btn cyan" id="pw-cancel">Cancel</button>
-        <button class="btn" id="pw-confirm">Confirm</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
-  const input = overlay.querySelector('#pw-input');
-  input.focus();
-  function confirmFn() {
-    if (input.value === APP_PASSWORD) { overlay.remove(); onSuccess(); }
-    else { overlay.querySelector('#pw-err').textContent = 'Incorrect password.'; input.value=''; input.focus(); }
-  }
-  overlay.querySelector('#pw-confirm').onclick = confirmFn;
-  overlay.querySelector('#pw-cancel').onclick = () => overlay.remove();
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') confirmFn(); });
-}
-
-function compressImage(file, maxW, quality) {
+function compressImageFile(file, maxDimension, quality) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
       img.onload = () => {
         let w = img.width, h = img.height;
-        if (w > maxW) { h = Math.round(h * (maxW / w)); w = maxW; }
-        const c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        c.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(c.toDataURL('image/jpeg', quality));
+        if (w > maxDimension) {
+          h = Math.round(h * (maxDimension / w));
+          w = maxDimension;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', quality));
       };
       img.onerror = reject;
       img.src = e.target.result;
@@ -514,165 +231,361 @@ function compressImage(file, maxW, quality) {
   });
 }
 
-function renderLoading(msg) {
-  app.innerHTML = `
-    <div id="loading-screen">
-      <div class="eyebrow">CONNECTING</div>
-      <div class="spinner"></div>
-      <div class="stat-line" style="font-size:13px;">${esc(msg || 'Working...')}</div>
-    </div>`;
+function initGoogleIdentity() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CONFIG.CLIENT_ID,
+    scope: CONFIG.SCOPES,
+    callback: async (res) => {
+      const wasSilent = isSilentRefreshActive;
+      isSilentRefreshActive = false;
+      if (res.error) {
+        if (wasSilent) { currentScreen = 'login'; render(); return; }
+        showNotification(`Authentication error: ${res.error}`, true);
+        currentScreen = 'login';
+        render();
+        return;
+      }
+      Storage.setToken(res.access_token);
+      await postAuthentication(res.expires_in, false, wasSilent);
+    }
+  });
 }
 
-function renderPinLock() {
-  app.innerHTML = `
-    <div id="login-screen">
-      <div class="eyebrow" style="text-align:center;">OPTP SCH III // SECURE ACCESS</div>
-      <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
-      <div class="panel login-box">
-        <div class="stat-line" style="font-size:13px;margin-bottom:14px;">Enter the app password to continue.</div>
-        <div class="field" style="text-align:left;">
-          <input type="password" id="pinlock-input" placeholder="Enter password" autocomplete="off">
-        </div>
-        <div id="pinlock-err" style="color:var(--danger);font-size:11.5px;min-height:16px;margin:6px 0 4px;"></div>
-        <button class="btn" id="pinlock-btn" style="width:100%;margin-top:8px;">Unlock</button>
-      </div>
-    </div>`;
-  const input = document.getElementById('pinlock-input');
-  input.focus();
-  function tryUnlock() {
-    if (input.value === APP_PASSWORD) {
-      attemptAutoLogin();
-    } else {
-      document.getElementById('pinlock-err').textContent = 'Incorrect password.';
-      input.value=''; input.focus();
+window.addEventListener('load', () => {
+  const timer = setInterval(() => {
+    if (window.google?.accounts?.oauth2) {
+      clearInterval(timer);
+      initGoogleIdentity();
+      currentScreen = 'pinlock';
+      render();
+    }
+  }, 100);
+});
+
+async function trySessionRestore() {
+  const session = getStoredSession();
+  if (session?.token && session.expiresAt > Date.now()) {
+    currentScreen = 'loading';
+    render('Validating session...');
+    Storage.setToken(session.token);
+    await postAuthentication(null, true, true);
+    return;
+  }
+
+  const savedUser = session ? session.email : null;
+  if (!savedUser) {
+    currentScreen = 'login';
+    render();
+    return;
+  }
+
+  currentScreen = 'loading';
+  render('Restoring session...');
+  isSilentRefreshActive = true;
+  let settled = false;
+
+  const fallback = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      isSilentRefreshActive = false;
+      currentScreen = 'login';
+      render();
+    }
+  }, 6000);
+
+  const defaultCallback = tokenClient.callback;
+  tokenClient.callback = (res) => {
+    settled = true;
+    clearTimeout(fallback);
+    tokenClient.callback = defaultCallback;
+    defaultCallback(res);
+  };
+
+  try {
+    tokenClient.requestAccessToken({ prompt: 'none', hint: savedUser });
+  } catch (err) {
+    if (!settled) {
+      settled = true;
+      clearTimeout(fallback);
+      isSilentRefreshActive = false;
+      currentScreen = 'login';
+      render();
     }
   }
-  document.getElementById('pinlock-btn').onclick = tryUnlock;
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); });
 }
 
-function renderLogin() {
-  app.innerHTML = `
-    <div id="login-screen">
-      <div class="eyebrow" style="text-align:center;">OPTP SCH III // SECURE ACCESS</div>
-      <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
-      <div class="panel login-box">
-        <div class="stat-line" style="font-size:13px;margin-bottom:10px;">Sign in with your Google account to connect Drive storage.</div>
-        <div class="gsi-btn-wrap">
-          <button class="btn" id="google-login-btn" style="padding:12px 26px;">Sign in with Google</button>
-        </div>
+async function postAuthentication(expiresInSec, fromCache = false, isSilent = false) {
+  currentScreen = 'loading';
+  render('Verifying Google credentials...');
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${Storage.token}` }
+    });
+    if (!res.ok) {
+      purgeSession();
+      Storage.setToken(null);
+      currentScreen = 'login';
+      render();
+      if (!isSilent) showNotification('Google session validation failed.', true);
+      return;
+    }
+    const profile = await res.json();
+    const email = String(profile.email || '').trim().toLowerCase();
+
+    if (!isEmailAuthorized(email)) {
+      purgeSession();
+      Storage.setToken(null);
+      currentScreen = 'login';
+      render();
+      showNotification('Unauthorized account. Access denied.', true);
+      return;
+    }
+
+    currentSessionUser = email;
+    if (!fromCache) persistSession(currentSessionUser, Storage.token, expiresInSec);
+
+    render('Configuring storage workspace...');
+    await initializeDirectories();
+
+    render('Loading employee database...');
+    await syncAllRecords();
+
+    currentScreen = 'dashboard';
+    render();
+  } catch (err) {
+    if (isSilent) {
+      Storage.setToken(null);
+      currentScreen = 'login';
+      render();
+      return;
+    }
+    showNotification('Drive storage connection failure.', true);
+    currentScreen = 'login';
+    render();
+  }
+}
+
+async function initializeDirectories() {
+  folderRootId = await Storage.resolveFolder('OPTP Employee Record');
+  folderActiveId = await Storage.resolveFolder('Current Employees', folderRootId);
+  folderArchiveId = await Storage.resolveFolder('Resigned or Retired Employees', folderRootId);
+}
+
+async function loadDirectoryProfiles(parentId) {
+  const items = await Storage.fetchChildren(parentId);
+  const directories = items.filter(i => i.mimeType === 'application/vnd.google-apps.folder');
+
+  return Promise.all(directories.map(async (folder) => {
+    const files = await Storage.fetchChildren(folder.id);
+    const profileDoc = files.find(f => f.name === 'profile.json');
+    const photoDoc = files.find(f => f.name === 'picture.jpg');
+    const cnicFrontDoc = files.find(f => f.name === 'cnic_front.jpg');
+    const cnicBackDoc = files.find(f => f.name === 'cnic_back.jpg');
+
+    let record = {};
+    if (profileDoc) {
+      try {
+        record = JSON.parse(await Storage.readTextFile(profileDoc.id));
+      } catch (e) {}
+    }
+    record.folderId = folder.id;
+    record.profileFileId = profileDoc?.id || null;
+    record.pictureFileId = photoDoc?.id || null;
+    record.cnicFrontFileId = cnicFrontDoc?.id || null;
+    record.cnicBackFileId = cnicBackDoc?.id || null;
+
+    if (photoDoc) {
+      try {
+        record.picture = await Storage.readBase64(photoDoc.id);
+      } catch (e) {}
+    }
+    if (!record.id) record.id = folder.id;
+    return record;
+  }));
+}
+
+async function syncAllRecords() {
+  activeEmployees = await loadDirectoryProfiles(folderActiveId);
+  archivedEmployees = await loadDirectoryProfiles(folderArchiveId);
+}
+
+async function fetchFullAttachments(record) {
+  if (record.pictureFileId && !record.picture) {
+    try { record.picture = await Storage.readBase64(record.pictureFileId); } catch (e) {}
+  }
+  if (record.cnicFrontFileId && !record.cnicFront) {
+    try { record.cnicFront = await Storage.readBase64(record.cnicFrontFileId); } catch (e) {}
+  }
+  if (record.cnicBackFileId && !record.cnicBack) {
+    try { record.cnicBack = await Storage.readBase64(record.cnicBackFileId); } catch (e) {}
+  }
+  return record;
+}
+
+function sanitizeProfile(data) {
+  const clone = Object.assign({}, data);
+  delete clone.picture;
+  delete clone.cnicFront;
+  delete clone.cnicBack;
+  delete clone._hasPicChanged;
+  delete clone._hasFrontChanged;
+  delete clone._hasBackChanged;
+  return clone;
+}
+
+async function insertEmployee(data) {
+  const folderTitle = `${data.fullName || 'Staff'} - ${data.cnic || data.id}`;
+  const folderId = await Storage.createFolder(folderTitle, folderActiveId);
+  data.folderId = folderId;
+  data.profileFileId = await Storage.uploadFile('profile.json', 'application/json', folderId, JSON.stringify(sanitizeProfile(data)), true);
+  if (data.picture) data.pictureFileId = await Storage.uploadFile('picture.jpg', 'image/jpeg', folderId, data.picture, false);
+  if (data.cnicFront) data.cnicFrontFileId = await Storage.uploadFile('cnic_front.jpg', 'image/jpeg', folderId, data.cnicFront, false);
+  if (data.cnicBack) data.cnicBackFileId = await Storage.uploadFile('cnic_back.jpg', 'image/jpeg', folderId, data.cnicBack, false);
+  return data;
+}
+
+async function modifyEmployee(data) {
+  const folderTitle = `${data.fullName || 'Staff'} - ${data.cnic || data.id}`;
+  await Storage.setFileName(data.folderId, folderTitle);
+
+  if (data.profileFileId) {
+    await Storage.patchFile(data.profileFileId, 'application/json', JSON.stringify(sanitizeProfile(data)), true);
+  } else {
+    data.profileFileId = await Storage.uploadFile('profile.json', 'application/json', data.folderId, JSON.stringify(sanitizeProfile(data)), true);
+  }
+
+  if (data._hasPicChanged && data.picture) {
+    if (data.pictureFileId) await Storage.patchFile(data.pictureFileId, 'image/jpeg', data.picture, false);
+    else data.pictureFileId = await Storage.uploadFile('picture.jpg', 'image/jpeg', data.folderId, data.picture, false);
+  }
+  if (data._hasFrontChanged && data.cnicFront) {
+    if (data.cnicFrontFileId) await Storage.patchFile(data.cnicFrontFileId, 'image/jpeg', data.cnicFront, false);
+    else data.cnicFrontFileId = await Storage.uploadFile('cnic_front.jpg', 'image/jpeg', data.folderId, data.cnicFront, false);
+  }
+  if (data._hasBackChanged && data.cnicBack) {
+    if (data.cnicBackFileId) await Storage.patchFile(data.cnicBackFileId, 'image/jpeg', data.cnicBack, false);
+    else data.cnicBackFileId = await Storage.uploadFile('cnic_back.jpg', 'image/jpeg', data.folderId, data.cnicBack, false);
+  }
+  delete data._hasPicChanged;
+  delete data._hasFrontChanged;
+  delete data._hasBackChanged;
+}
+
+function promptAuth(label, onSuccess) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-backdrop';
+  overlay.innerHTML = `
+    <div class="card auth-dialog">
+      <div class="sub-header">VERIFICATION</div>
+      <h3 class="accent-text" style="margin:8px 0 16px;font-size:16px;">${sanitize(label)}</h3>
+      <div class="field"><input type="password" id="dialog-pin" placeholder="Enter PIN" autocomplete="off"></div>
+      <div id="dialog-pin-error" style="color:var(--danger);font-size:11px;min-height:14px;margin-bottom:10px;"></div>
+      <div style="display:flex;gap:10px;justify-content:center;">
+        <button class="btn cyan" id="dialog-abort">Cancel</button>
+        <button class="btn" id="dialog-ok">Confirm</button>
       </div>
     </div>`;
-  document.getElementById('google-login-btn').onclick = loginWithGoogle;
+  document.body.appendChild(overlay);
+  const input = overlay.querySelector('#dialog-pin');
+  input.focus();
+
+  async function verify() {
+    const hashed = await computeSha256(input.value);
+    if (hashed === CONFIG.PIN_HASH) {
+      overlay.remove();
+      onSuccess();
+    } else {
+      overlay.querySelector('#dialog-pin-error').textContent = 'Incorrect PIN.';
+      input.value = '';
+      input.focus();
+    }
+  }
+
+  overlay.querySelector('#dialog-ok').onclick = verify;
+  overlay.querySelector('#dialog-abort').onclick = () => overlay.remove();
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') verify(); });
 }
 
-function topbarHTML() {
+function renderHeaderBar() {
   return `
-  <div id="topbar">
+  <div id="nav">
     <div>
-      <div class="eyebrow">OPTP SCH III</div>
-      <h2 class="glow" style="font-size:18px;">Employee Record System</h2>
+      <div class="sub-header">OPTP SCH III</div>
+      <h2 class="accent-text" style="font-size:18px;">Employee Record System</h2>
     </div>
     <div style="text-align:right;">
-      <div class="who">Signed in as <b>${esc(userEmail)}</b></div>
-      <button class="btn red" id="logout-btn" style="margin-top:8px;padding:6px 14px;font-size:11px;">Logout</button>
+      <div class="user-info">Signed in as <b>${sanitize(currentSessionUser)}</b></div>
+      <button class="btn red" id="signout-btn" style="margin-top:8px;padding:6px 14px;font-size:11px;">Logout</button>
     </div>
   </div>`;
 }
 
-function renderDashboard() {
-  app.innerHTML = topbarHTML() + `
-  <div id="main-wrap">
-    <div class="dash-grid">
-      <div class="panel dash-card" id="card-current">
-        <div class="icon">🗂️</div><div class="lbl">Current Employees</div>
-        <div class="count">${currentEmployees.length}</div>
-        <div class="stat-line">View / search active staff</div>
-      </div>
-      <div class="panel dash-card" id="card-new">
-        <div class="icon">➕</div><div class="lbl">New Employee</div>
-        <div class="count">+</div>
-        <div class="stat-line">Add a new employee record</div>
-      </div>
-      <div class="panel dash-card" id="card-resigned">
-        <div class="icon">📁</div><div class="lbl">Resigned / Retired</div>
-        <div class="count">${resignedEmployees.length}</div>
-        <div class="stat-line">Past employee archive</div>
-      </div>
-    </div>
-  </div>`;
-  document.getElementById('logout-btn').onclick = logoutFlow;
-  document.getElementById('card-current').onclick = () => { view = 'current'; render(); };
-  document.getElementById('card-new').onclick = () => askPassword('Enter password to add a new employee', () => { view = 'new'; render(); });
-  document.getElementById('card-resigned').onclick = () => { view = 'resigned'; render(); };
-}
-
-function formFieldsHTML(emp = {}) {
-  const g = (k, d) => esc(emp[k] !== undefined ? emp[k] : (d || ''));
-  const raw = (k, d) => emp[k] !== undefined ? emp[k] : (d || '');
+function renderFormMarkup(emp = {}) {
+  const v = (key, fallback = '') => sanitize(emp[key] !== undefined ? emp[key] : fallback);
+  const raw = (key, fallback = '') => emp[key] !== undefined ? emp[key] : fallback;
   return `
-    <div class="subhead">Employment & Personal Details</div>
+    <div class="section-label">Personal Details</div>
     <div class="row">
-      <div class="field"><label class="req">Position</label><input id="f-position" value="${g('position')}" placeholder="e.g. Branch Manager"></div>
-      <div class="field"><label>Salary</label><input type="number" id="f-salary" value="${g('salary')}" placeholder="PKR"></div>
+      <div class="field"><label class="req">Position</label><input id="f-position" value="${v('position')}" placeholder="e.g. Branch Supervisor"></div>
+      <div class="field"><label>Salary</label><input type="number" id="f-salary" value="${v('salary')}" placeholder="PKR"></div>
     </div>
     <div class="row">
-      <div class="field"><label class="req">Full Name</label><input id="f-fullName" value="${g('fullName')}"></div>
-      <div class="field"><label>Father Name</label><input id="f-fatherName" value="${g('fatherName')}"></div>
+      <div class="field"><label class="req">Full Name</label><input id="f-fullName" value="${v('fullName')}"></div>
+      <div class="field"><label>Father Name</label><input id="f-fatherName" value="${v('fatherName')}"></div>
     </div>
     <div class="row">
-      <div class="field"><label class="req">Date of Birth</label><input type="date" id="f-dob" value="${g('dob')}"></div>
-      <div class="field"><label class="req">CNIC</label><input id="f-cnic" placeholder="xxxxx-xxxxxxx-x" maxlength="15" value="${g('cnic')}"></div>
+      <div class="field"><label class="req">Date of Birth</label><input type="date" id="f-dob" value="${v('dob')}"></div>
+      <div class="field"><label class="req">CNIC</label><input id="f-cnic" placeholder="xxxxx-xxxxxxx-x" maxlength="15" value="${v('cnic')}"></div>
     </div>
     <div class="row">
       <div class="field">
         <label>Gender</label>
         <div class="radio-group">
-          ${['Male','Female','Transgender'].map(o => `<label class="radio-opt"><input type="radio" name="f-gender" value="${o}" ${raw('gender') === o ? 'checked' : ''}> ${o}</label>`).join('')}
+          ${['Male','Female','Transgender'].map(item => `<label class="radio-opt"><input type="radio" name="f-gender" value="${item}" ${raw('gender') === item ? 'checked' : ''}> ${item}</label>`).join('')}
         </div>
       </div>
-      <div class="field"><label class="req">Joining Date</label><input type="date" id="f-joiningDate" value="${g('joiningDate')}"></div>
+      <div class="field"><label class="req">Joining Date</label><input type="date" id="f-joiningDate" value="${v('joiningDate')}"></div>
     </div>
     <div class="row">
       <div class="field">
         <label>Marital Status</label>
         <div class="radio-group">
-          ${['Single','Married'].map(o => `<label class="radio-opt"><input type="radio" name="f-relStatus" value="${o}" ${raw('relationshipStatus') === o ? 'checked' : ''}> ${o}</label>`).join('')}
+          ${['Single','Married'].map(item => `<label class="radio-opt"><input type="radio" name="f-relStatus" value="${item}" ${raw('relationshipStatus') === item ? 'checked' : ''}> ${item}</label>`).join('')}
         </div>
       </div>
       <div class="field ${raw('relationshipStatus') === 'Married' ? '' : 'hidden'}" id="children-wrap">
-        <label>Number of Children</label><input type="number" min="0" id="f-childrenCount" value="${g('childrenCount')}">
+        <label>Number of Children</label><input type="number" min="0" id="f-childrenCount" value="${v('childrenCount')}">
       </div>
     </div>
 
-    <div class="subhead">Contact & Address</div>
+    <div class="section-label">Address & Contact</div>
     <div class="row">
-      <div class="field"><label class="req">Permanent Address</label><textarea id="f-permAddress" rows="2">${g('permanentAddress')}</textarea></div>
-      <div class="field"><label class="req">Temporary Address</label><textarea id="f-tempAddress" rows="2">${g('temporaryAddress')}</textarea></div>
+      <div class="field"><label class="req">Permanent Address</label><textarea id="f-permAddress" rows="2">${v('permanentAddress')}</textarea></div>
+      <div class="field"><label class="req">Temporary Address</label><textarea id="f-tempAddress" rows="2">${v('temporaryAddress')}</textarea></div>
     </div>
     <div class="row">
-      <div class="field"><label class="req">Mobile Number</label><input type="tel" id="f-mobileNumber" placeholder="03xx-xxxxxxx" value="${g('mobileNumber')}"></div>
-      <div class="field"><label class="req">Home Number (For emergency Contact)</label><input type="tel" id="f-homeNumber" placeholder="Emergency contact number" value="${g('homeNumber')}"></div>
+      <div class="field"><label class="req">Mobile Number</label><input type="tel" id="f-mobileNumber" placeholder="03xx-xxxxxxx" value="${v('mobileNumber')}"></div>
+      <div class="field"><label class="req">Home Number (Emergency)</label><input type="tel" id="f-homeNumber" placeholder="Emergency Phone" value="${v('homeNumber')}"></div>
     </div>
     <div class="row">
-      <div class="field"><label>Email</label><input type="email" id="f-email" placeholder="name@example.com" value="${g('email')}"></div>
+      <div class="field"><label>Email</label><input type="email" id="f-email" placeholder="staff@example.com" value="${v('email')}"></div>
     </div>
 
-    <div class="subhead">Qualification</div>
+    <div class="section-label">Education</div>
     <div class="field">
       <label class="req">Qualification</label>
       <select id="f-qualification">
-        <option value="">-- Select Qualification --</option>
+        <option value="">-- Select --</option>
         ${['Under Matric','Matric','Inter','Graduation','Graduation Continue','Masters'].map(o =>
           `<option value="${o}" ${raw('qualification') === o ? 'selected' : ''}>${o}</option>`).join('')}
       </select>
     </div>
     <div class="field ${raw('qualification') === 'Graduation Continue' ? '' : 'hidden'}" id="qual-detail-wrap">
       <label class="req">Department / University / Semester Detail</label>
-      <textarea id="f-qualificationDetail" rows="2" placeholder="e.g. BSCS, 4th Semester">${g('qualificationDetail')}</textarea>
+      <textarea id="f-qualificationDetail" rows="2" placeholder="e.g. BSCS, 4th Semester">${v('qualificationDetail')}</textarea>
     </div>
 
-    <div class="subhead">Experience</div>
+    <div class="section-label">Experience</div>
     <div class="field">
       <label class="req">Previous Experience?</label>
       <div class="radio-group">
@@ -680,48 +593,48 @@ function formFieldsHTML(emp = {}) {
       </div>
     </div>
     <div id="prevexp-detail-wrap" class="${raw('previousExperience') === 'Yes' ? '' : 'hidden'}">
-      <div class="field"><label class="req">Experience Detail</label><textarea id="f-prevExpDetail" rows="2">${g('prevExpDetail')}</textarea></div>
+      <div class="field"><label class="req">Experience Detail</label><textarea id="f-prevExpDetail" rows="2">${v('prevExpDetail')}</textarea></div>
       <div class="row">
-        <div class="field"><label class="req">Previous Salary</label><input type="number" id="f-prevSalary" value="${g('prevSalary')}"></div>
-        <div class="field"><label class="req">Reason for Leaving</label><input id="f-prevReason" value="${g('prevReason')}"></div>
+        <div class="field"><label class="req">Previous Salary</label><input type="number" id="f-prevSalary" value="${v('prevSalary')}"></div>
+        <div class="field"><label class="req">Reason for Leaving</label><input id="f-prevReason" value="${v('prevReason')}"></div>
       </div>
     </div>
 
-    <div class="subhead">Documents</div>
+    <div class="section-label">Attachments</div>
     <div class="row">
       <div class="field">
         <label class="req">Upload Picture</label>
-        <div class="upload-box" id="pic-box">Click to select photo<br><img class="upload-preview ${raw('picture') ? '' : 'hidden'}" id="pic-preview" src="${raw('picture') || ''}"></div>
+        <div class="file-drop" id="pic-box">Select Photo<br><img class="file-thumb ${raw('picture') ? '' : 'hidden'}" id="pic-preview" src="${raw('picture') || ''}"></div>
         <input type="file" accept="image/*" id="f-picture" class="hidden">
       </div>
       <div class="field">
-        <label class="req">CNIC Front Side</label>
-        <div class="upload-box" id="cnicf-box">Click to select file<br><img class="upload-preview ${raw('cnicFront') ? '' : 'hidden'}" id="cnicf-preview" src="${raw('cnicFront') || ''}"></div>
+        <label class="req">CNIC Front</label>
+        <div class="file-drop" id="cnicf-box">Select Front Side<br><img class="file-thumb ${raw('cnicFront') ? '' : 'hidden'}" id="cnicf-preview" src="${raw('cnicFront') || ''}"></div>
         <input type="file" accept="image/*" id="f-cnicFront" class="hidden">
       </div>
       <div class="field">
-        <label class="req">CNIC Back Side</label>
-        <div class="upload-box" id="cnicb-box">Click to select file<br><img class="upload-preview ${raw('cnicBack') ? '' : 'hidden'}" id="cnicb-preview" src="${raw('cnicBack') || ''}"></div>
+        <label class="req">CNIC Back</label>
+        <div class="file-drop" id="cnicb-box">Select Back Side<br><img class="file-thumb ${raw('cnicBack') ? '' : 'hidden'}" id="cnicb-preview" src="${raw('cnicBack') || ''}"></div>
         <input type="file" accept="image/*" id="f-cnicBack" class="hidden">
       </div>
     </div>`;
 }
 
-function wireFormInteractions(store) {
-  function formatCNIC(raw) {
-    const digits = raw.replace(/\D/g, '').slice(0, 13);
+function bindFormEvents(store) {
+  function formatCnic(val) {
+    const digits = val.replace(/\D/g, '').slice(0, 13);
     if (digits.length > 12) return digits.slice(0, 5) + '-' + digits.slice(5, 12) + '-' + digits.slice(12);
     if (digits.length > 5) return digits.slice(0, 5) + '-' + digits.slice(5);
     return digits;
   }
 
-  const cnicInput = document.getElementById('f-cnic');
-  if (cnicInput) {
-    cnicInput.setAttribute('inputmode', 'numeric');
-    cnicInput.addEventListener('input', () => {
-      const pos = cnicInput.selectionStart === cnicInput.value.length;
-      cnicInput.value = formatCNIC(cnicInput.value);
-      if (pos) cnicInput.setSelectionRange(cnicInput.value.length, cnicInput.value.length);
+  const cnic = document.getElementById('f-cnic');
+  if (cnic) {
+    cnic.setAttribute('inputmode', 'numeric');
+    cnic.addEventListener('input', () => {
+      const isEnd = cnic.selectionStart === cnic.value.length;
+      cnic.value = formatCnic(cnic.value);
+      if (isEnd) cnic.setSelectionRange(cnic.value.length, cnic.value.length);
     });
   }
 
@@ -730,7 +643,7 @@ function wireFormInteractions(store) {
     if (el) {
       el.addEventListener('click', () => {
         if (typeof el.showPicker === 'function') {
-          try { el.showPicker(); } catch(e) {}
+          try { el.showPicker(); } catch (e) {}
         }
       });
     }
@@ -748,226 +661,133 @@ function wireFormInteractions(store) {
     document.getElementById('prevexp-detail-wrap').classList.toggle('hidden', document.querySelector('input[name="f-prevExp"]:checked')?.value !== 'Yes');
   }));
 
-  function wireUpload(boxId, inputId, previewId, storeKey, changedFlag, maxW, quality) {
+  function setupUploader(boxId, inputId, previewId, storeKey, changeFlag, maxDim, quality) {
     document.getElementById(boxId).onclick = () => document.getElementById(inputId).click();
     document.getElementById(inputId).addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
       try {
-        const dataUrl = await compressImage(file, maxW, quality);
-        store[storeKey] = dataUrl;
-        store[changedFlag] = true;
+        const b64 = await compressImageFile(file, maxDim, quality);
+        store[storeKey] = b64;
+        store[changeFlag] = true;
         const prev = document.getElementById(previewId);
-        prev.src = dataUrl;
+        prev.src = b64;
         prev.classList.remove('hidden');
-      } catch(err) {
-        toast('Image processing error.', true);
+      } catch (err) {
+        showNotification('Image compression error.', true);
       }
     });
   }
 
-  wireUpload('pic-box', 'f-picture', 'pic-preview', 'picture', '_pictureChanged', 500, 0.75);
-  wireUpload('cnicf-box', 'f-cnicFront', 'cnicf-preview', 'cnicFront', '_cnicFrontChanged', 750, 0.65);
-  wireUpload('cnicb-box', 'f-cnicBack', 'cnicb-preview', 'cnicBack', '_cnicBackChanged', 750, 0.65);
+  setupUploader('pic-box', 'f-picture', 'pic-preview', 'picture', '_hasPicChanged', 500, 0.75);
+  setupUploader('cnicf-box', 'f-cnicFront', 'cnicf-preview', 'cnicFront', '_hasFrontChanged', 750, 0.65);
+  setupUploader('cnicb-box', 'f-cnicBack', 'cnicb-preview', 'cnicBack', '_hasBackChanged', 750, 0.65);
 }
 
-function collectFormData(existing) {
-  const val = id => (document.getElementById(id) ? document.getElementById(id).value.trim() : '');
-  const radio = name => document.querySelector(`input[name="${name}"]:checked`)?.value || '';
-  const data = Object.assign({}, existing || {});
-  data.position = val('f-position');
-  data.salary = val('f-salary');
-  data.fullName = val('f-fullName');
-  data.fatherName = val('f-fatherName');
-  data.dob = val('f-dob');
-  data.cnic = val('f-cnic');
-  data.gender = radio('f-gender');
-  data.joiningDate = val('f-joiningDate');
-  data.relationshipStatus = radio('f-relStatus');
-  data.childrenCount = val('f-childrenCount');
-  data.permanentAddress = val('f-permAddress');
-  data.temporaryAddress = val('f-tempAddress');
-  data.mobileNumber = val('f-mobileNumber');
-  data.homeNumber = val('f-homeNumber');
-  data.email = val('f-email');
-  data.qualification = document.getElementById('f-qualification')?.value || '';
-  data.qualificationDetail = val('f-qualificationDetail');
-  data.previousExperience = radio('f-prevExp');
-  data.prevExpDetail = val('f-prevExpDetail');
-  data.prevSalary = val('f-prevSalary');
-  data.prevReason = val('f-prevReason');
-  return data;
+function parseFormData(existing = {}) {
+  const getVal = id => document.getElementById(id)?.value?.trim() || '';
+  const getRadio = name => document.querySelector(`input[name="${name}"]:checked`)?.value || '';
+
+  return Object.assign({}, existing, {
+    position: getVal('f-position'),
+    salary: getVal('f-salary'),
+    fullName: getVal('f-fullName'),
+    fatherName: getVal('f-fatherName'),
+    dob: getVal('f-dob'),
+    cnic: getVal('f-cnic'),
+    gender: getRadio('f-gender'),
+    joiningDate: getVal('f-joiningDate'),
+    relationshipStatus: getRadio('f-relStatus'),
+    childrenCount: getVal('f-childrenCount'),
+    permanentAddress: getVal('f-permAddress'),
+    temporaryAddress: getVal('f-tempAddress'),
+    mobileNumber: getVal('f-mobileNumber'),
+    homeNumber: getVal('f-homeNumber'),
+    email: getVal('f-email'),
+    qualification: document.getElementById('f-qualification')?.value || '',
+    qualificationDetail: getVal('f-qualificationDetail'),
+    previousExperience: getRadio('f-prevExp'),
+    prevExpDetail: getVal('f-prevExpDetail'),
+    prevSalary: getVal('f-prevSalary'),
+    prevReason: getVal('f-prevReason')
+  });
 }
 
-function validateForm(data) {
+function validateRecordForm(d) {
   const missing = [];
-  if (!data.position) missing.push('Position');
-  if (!data.fullName) missing.push('Full Name');
-  if (!data.dob) missing.push('Date of Birth');
-  if (!data.cnic) missing.push('CNIC');
-  if (!data.joiningDate) missing.push('Joining Date');
-  if (!data.permanentAddress) missing.push('Permanent Address');
-  if (!data.temporaryAddress) missing.push('Temporary Address');
-  if (!data.mobileNumber) missing.push('Mobile Number');
-  if (!data.homeNumber) missing.push('Home Number (Emergency Contact)');
-  if (!data.qualification) missing.push('Qualification');
-  if (data.qualification === 'Graduation Continue' && !data.qualificationDetail) missing.push('Qualification Detail');
-  if (!data.previousExperience) missing.push('Previous Experience (Yes/No)');
-  if (data.previousExperience === 'Yes') {
-    if (!data.prevExpDetail) missing.push('Experience Detail');
-    if (!data.prevSalary) missing.push('Previous Salary');
-    if (!data.prevReason) missing.push('Reason for Leaving');
+  if (!d.position) missing.push('Position');
+  if (!d.fullName) missing.push('Full Name');
+  if (!d.dob) missing.push('Date of Birth');
+  if (!d.cnic) missing.push('CNIC');
+  if (!d.joiningDate) missing.push('Joining Date');
+  if (!d.permanentAddress) missing.push('Permanent Address');
+  if (!d.temporaryAddress) missing.push('Temporary Address');
+  if (!d.mobileNumber) missing.push('Mobile Number');
+  if (!d.homeNumber) missing.push('Home Number (Emergency)');
+  if (!d.qualification) missing.push('Qualification');
+  if (d.qualification === 'Graduation Continue' && !d.qualificationDetail) missing.push('Academic Details');
+  if (d.previousExperience === 'Yes') {
+    if (!d.prevExpDetail) missing.push('Experience Details');
+    if (!d.prevSalary) missing.push('Previous Salary');
+    if (!d.prevReason) missing.push('Reason for Leaving');
   }
-  if (!data.picture) missing.push('Picture');
-  if (!data.cnicFront) missing.push('CNIC Front');
-  if (!data.cnicBack) missing.push('CNIC Back');
+  if (!d.picture) missing.push('Picture');
+  if (!d.cnicFront) missing.push('CNIC Front');
+  if (!d.cnicBack) missing.push('CNIC Back');
   return missing;
 }
 
-function renderNewEmployee() {
-  const store = {};
-  app.innerHTML = topbarHTML() + `
-  <div id="main-wrap">
-    <div class="section-title"><span class="back-link" id="back-dash">&larr; Dashboard</span></div>
-    <h2 class="glow" style="margin:10px 0 4px;">New Employee Record</h2>
-    <div class="stat-line">Fields with * are mandatory.</div>
-    <div class="panel form-panel">
-      ${formFieldsHTML({})}
-      <div class="form-actions">
-        <button class="btn" id="save-new-btn">Save Employee</button>
-        <button class="btn cyan" id="cancel-new-btn">Cancel</button>
-      </div>
-    </div>
-  </div>`;
-  document.getElementById('logout-btn').onclick = logoutFlow;
-  wireFormInteractions(store);
-  document.getElementById('back-dash').onclick = () => { view = 'dashboard'; render(); };
-  document.getElementById('cancel-new-btn').onclick = () => { view = 'dashboard'; render(); };
-  document.getElementById('save-new-btn').onclick = async () => {
-    const data = collectFormData(store);
-    const missing = validateForm(data);
-    if (missing.length) {
-      toast('Required: ' + missing.join(', '), true);
-      return;
-    }
-    const btn = document.getElementById('save-new-btn');
-    btn.disabled = true;
-    btn.textContent = 'Saving to Drive...';
-    try {
-      data.id = uid();
-      data.status = 'current';
-      const saved = await createEmployeeInDrive(data);
-      currentEmployees.push(saved);
-      toast('Employee saved successfully.');
-      view = 'current';
-      render();
-    } catch(e) {
-      toast('Failed to save record.', true);
-      btn.disabled = false;
-      btn.textContent = 'Save Employee';
-    }
-  };
-}
-
-function fileGridHTML(list, statusClass) {
-  if (!list.length) return `<div class="empty-note panel">No records found.</div>`;
-  return `<div class="file-grid">` + list.map(emp => `
-    <div class="panel file-card" data-id="${esc(emp.id)}">
-      ${emp.picture ? `<img class="file-thumb" src="${esc(emp.picture)}">` : `<div class="file-thumb placeholder">👤</div>`}
-      <div class="file-name">${esc(emp.fullName || '(No name)')}</div>
-      <div class="file-id">${esc(emp.cnic || emp.id)}</div>
-      <div class="file-status ${statusClass}">${emp.status === 'current' ? 'Active' : esc(emp.exitType || 'Archived')}</div>
+function renderEmployeeGrid(list, statusClass) {
+  if (!list.length) return `<div class="empty-view card">No records found.</div>`;
+  return `<div class="records-grid">` + list.map(emp => `
+    <div class="card employee-card" data-id="${sanitize(emp.id)}">
+      ${emp.picture ? `<img class="avatar" src="${sanitize(emp.picture)}">` : `<div class="avatar empty">👤</div>`}
+      <div class="emp-name">${sanitize(emp.fullName || '(No name)')}</div>
+      <div class="emp-id">${sanitize(emp.cnic || emp.id)}</div>
+      <div class="emp-status ${statusClass}">${emp.status === 'current' ? 'Active' : sanitize(emp.exitType || 'Archived')}</div>
     </div>`).join('') + `</div>`;
 }
 
-function filterList(list, query) {
-  if (!query) return list;
-  const q = query.toLowerCase();
-  return list.filter(e => (e.fullName || '').toLowerCase().includes(q) || (e.cnic || '').toLowerCase().includes(q));
+function filterRecords(list, q) {
+  if (!q) return list;
+  const target = q.toLowerCase();
+  return list.filter(e => (e.fullName || '').toLowerCase().includes(target) || (e.cnic || '').toLowerCase().includes(target));
 }
 
-function renderCurrentList() {
-  const filtered = filterList(currentEmployees, searchQueryCurrent);
-  app.innerHTML = topbarHTML() + `
-  <div id="main-wrap">
-    <div class="section-title"><span class="back-link" id="back-dash">&larr; Dashboard</span></div>
-    <h2 class="glow" style="margin:10px 0 4px;">Current Employees (${currentEmployees.length})</h2>
-    <div class="search-bar"><input id="search-current" placeholder="Search by name or CNIC..." value="${esc(searchQueryCurrent)}"></div>
-    <div id="grid-wrap">${fileGridHTML(filtered, 'active')}</div>
-  </div>`;
-  document.getElementById('logout-btn').onclick = logoutFlow;
-  document.getElementById('back-dash').onclick = () => { view = 'dashboard'; render(); };
-  const searchInput = document.getElementById('search-current');
-  searchInput.addEventListener('input', e => {
-    searchQueryCurrent = e.target.value;
-    document.getElementById('grid-wrap').innerHTML = fileGridHTML(filterList(currentEmployees, searchQueryCurrent), 'active');
-    wireFileCardClicks('current');
-  });
-  wireFileCardClicks('current');
-}
+function buildPrintDocument(emp) {
+  const row = (label, val) => (val !== undefined && val !== null && String(val).trim() !== '') ? `<div class="prow"><div class="plabel">${sanitize(label)}</div><div class="pvalue">${sanitize(val)}</div></div>` : '';
 
-function renderResignedList() {
-  const filtered = filterList(resignedEmployees, searchQueryResigned);
-  app.innerHTML = topbarHTML() + `
-  <div id="main-wrap">
-    <div class="section-title"><span class="back-link" id="back-dash">&larr; Dashboard</span></div>
-    <h2 class="glow" style="margin:10px 0 4px;">Resigned / Retired Archives (${resignedEmployees.length})</h2>
-    <div class="search-bar"><input id="search-resigned" placeholder="Search by name or CNIC..." value="${esc(searchQueryResigned)}"></div>
-    <div id="grid-wrap">${fileGridHTML(filtered, 'gone')}</div>
-  </div>`;
-  document.getElementById('logout-btn').onclick = logoutFlow;
-  document.getElementById('back-dash').onclick = () => { view = 'dashboard'; render(); };
-  const searchInput = document.getElementById('search-resigned');
-  searchInput.addEventListener('input', e => {
-    searchQueryResigned = e.target.value;
-    document.getElementById('grid-wrap').innerHTML = fileGridHTML(filterList(resignedEmployees, searchQueryResigned), 'gone');
-    wireFileCardClicks('resigned');
-  });
-  wireFileCardClicks('resigned');
-}
-
-function wireFileCardClicks(source) {
-  document.querySelectorAll('.file-card').forEach(card => {
-    card.onclick = () => openDetail(card.getAttribute('data-id'), source);
-  });
-}
-
-function pfield(label, value) {
-  if (value === undefined || value === null || String(value).trim() === '') return '';
-  return `<div class="prow"><div class="plabel">${esc(label)}</div><div class="pvalue">${esc(value)}</div></div>`;
-}
-
-function buildPrintableHTML(emp) {
-  let rows = '';
-  rows += pfield('Position', emp.position);
-  rows += pfield('Salary', emp.salary);
-  rows += pfield('Full Name', emp.fullName);
-  rows += pfield('Father Name', emp.fatherName);
-  rows += pfield('Date of Birth', emp.dob);
-  rows += pfield('CNIC', emp.cnic);
-  rows += pfield('Gender', emp.gender);
-  rows += pfield('Joining Date', emp.joiningDate);
-  rows += pfield('Marital Status', emp.relationshipStatus);
-  if (emp.relationshipStatus === 'Married') rows += pfield('Number of Children', emp.childrenCount);
-  rows += pfield('Permanent Address', emp.permanentAddress);
-  rows += pfield('Temporary Address', emp.temporaryAddress);
-  rows += pfield('Mobile Number', emp.mobileNumber);
-  rows += pfield('Emergency Contact', emp.homeNumber);
-  rows += pfield('Email', emp.email);
-  rows += pfield('Qualification', emp.qualification);
-  if (emp.qualification === 'Graduation Continue') rows += pfield('Qualification Detail', emp.qualificationDetail);
-  rows += pfield('Previous Experience', emp.previousExperience);
+  let fields = '';
+  fields += row('Position', emp.position);
+  fields += row('Salary', emp.salary);
+  fields += row('Full Name', emp.fullName);
+  fields += row('Father Name', emp.fatherName);
+  fields += row('Date of Birth', emp.dob);
+  fields += row('CNIC', emp.cnic);
+  fields += row('Gender', emp.gender);
+  fields += row('Joining Date', emp.joiningDate);
+  fields += row('Marital Status', emp.relationshipStatus);
+  if (emp.relationshipStatus === 'Married') fields += row('Children', emp.childrenCount);
+  fields += row('Permanent Address', emp.permanentAddress);
+  fields += row('Temporary Address', emp.temporaryAddress);
+  fields += row('Mobile Number', emp.mobileNumber);
+  fields += row('Emergency Contact', emp.homeNumber);
+  fields += row('Email', emp.email);
+  fields += row('Qualification', emp.qualification);
+  if (emp.qualification === 'Graduation Continue') fields += row('Academic Details', emp.qualificationDetail);
+  fields += row('Previous Experience', emp.previousExperience);
   if (emp.previousExperience === 'Yes') {
-    rows += pfield('Experience Detail', emp.prevExpDetail);
-    rows += pfield('Previous Salary', emp.prevSalary);
-    rows += pfield('Reason for Leaving', emp.prevReason);
+    fields += row('Experience Detail', emp.prevExpDetail);
+    fields += row('Previous Salary', emp.prevSalary);
+    fields += row('Reason for Leaving', emp.prevReason);
   }
   if (emp.status === 'resigned') {
-    rows += pfield('Exit Type', emp.exitType);
-    rows += pfield('Exit Date', emp.exitDate);
-    rows += pfield('Exit Note', emp.exitNote);
+    fields += row('Exit Type', emp.exitType);
+    fields += row('Exit Date', emp.exitDate);
+    fields += row('Exit Note', emp.exitNote);
   }
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(emp.fullName || 'Employee')} - Record</title>
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${sanitize(emp.fullName || 'Employee')} - Record</title>
   <style>
     body{ font-family: Arial, sans-serif; color:#111; padding:24px; }
     .phead{ display:flex; justify-content:space-between; align-items:flex-end; border-bottom:3px solid #00b057; padding-bottom:14px; margin-bottom:20px; }
@@ -990,9 +810,9 @@ function buildPrintableHTML(emp) {
     <div class="phead"><div><h1>OPTP Sch III</h1><div style="font-size:11px;color:#555;">Employee Record File</div></div></div>
     <div class="ptop">
       ${emp.picture ? `<img class="photo" src="${emp.picture}">` : ''}
-      <div><div class="pname">${esc(emp.fullName || '')}</div><div class="pposition">${esc(emp.position || '')}</div></div>
+      <div><div class="pname">${sanitize(emp.fullName || '')}</div><div class="pposition">${sanitize(emp.position || '')}</div></div>
     </div>
-    <div class="pgrid">${rows}</div>
+    <div class="pgrid">${fields}</div>
     <div class="pdocs">
       ${emp.cnicFront ? `<div><img src="${emp.cnicFront}"><div class="dlbl">CNIC Front</div></div>` : ''}
       ${emp.cnicBack ? `<div><img src="${emp.cnicBack}"><div class="dlbl">CNIC Back</div></div>` : ''}
@@ -1001,143 +821,142 @@ function buildPrintableHTML(emp) {
   </body></html>`;
 }
 
-async function openPrintableRecord(emp) {
-  await loadAssetsForDetail(emp);
-  const html = buildPrintableHTML(emp);
-  const w = window.open('', '_blank', 'width=900,height=1000');
-  if (!w) {
-    toast('Popup blocked by browser. Please allow popups.', true);
+async function triggerPrint(emp) {
+  await fetchFullAttachments(emp);
+  const html = buildPrintDocument(emp);
+  const win = window.open('', '_blank', 'width=900,height=1000');
+  if (!win) {
+    showNotification('Popup blocked. Please permit popups.', true);
     return;
   }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
-  const triggerPrint = () => { try { w.focus(); w.print(); } catch(e) {} };
-  w.onload = triggerPrint;
-  setTimeout(triggerPrint, 400);
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  const printAction = () => { try { win.focus(); win.print(); } catch (e) {} };
+  win.onload = printAction;
+  setTimeout(printAction, 400);
 }
 
-function detailRow(k, v) {
-  return `<div class="detail-item"><div class="k">${esc(k)}</div><div class="v">${(v === undefined || v === '') ? '—' : esc(v)}</div></div>`;
+function renderFieldEntry(k, v) {
+  return `<div class="detail-entry"><div class="prop">${sanitize(k)}</div><div class="val">${(v === undefined || v === '') ? '—' : sanitize(v)}</div></div>`;
 }
 
-async function openDetail(id, source) {
-  const list = source === 'current' ? currentEmployees : resignedEmployees;
+async function displayDetailModal(id, source) {
+  const list = source === 'current' ? activeEmployees : archivedEmployees;
   const emp = list.find(e => e.id === id);
   if (!emp) return;
 
   const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
+  overlay.className = 'modal-backdrop';
   overlay.innerHTML = `
-    <div class="panel modal-box">
-      <span class="modal-close" id="detail-close">&times;</span>
-      <div class="eyebrow">${source === 'current' ? 'ACTIVE FILE' : 'ARCHIVED FILE'}</div>
-      <h2 class="glow" style="margin:6px 0 4px;">${esc(emp.fullName || '(No name)')}</h2>
-      <div class="stat-line">${esc(emp.position || '')}</div>
-      <div id="detail-doc-thumbs" class="doc-thumbs">
-        <div>${emp.picture ? `<img src="${emp.picture}">` : ''}<div class="lbl">Picture</div></div>
-        <div>${emp.cnicFront ? `<img src="${emp.cnicFront}">` : ''}<div class="lbl">CNIC Front</div></div>
-        <div>${emp.cnicBack ? `<img src="${emp.cnicBack}">` : ''}<div class="lbl">CNIC Back</div></div>
+    <div class="card modal-dialog">
+      <span class="modal-dismiss" id="detail-close">&times;</span>
+      <div class="sub-header">${source === 'current' ? 'ACTIVE FILE' : 'ARCHIVED FILE'}</div>
+      <h2 class="accent-text" style="margin:6px 0 4px;">${sanitize(emp.fullName || '(No name)')}</h2>
+      <div class="meta-text">${sanitize(emp.position || '')}</div>
+      <div id="detail-thumbs" class="document-previews">
+        <div>${emp.picture ? `<img src="${emp.picture}">` : ''}<div class="tag">Picture</div></div>
+        <div>${emp.cnicFront ? `<img src="${emp.cnicFront}">` : ''}<div class="tag">CNIC Front</div></div>
+        <div>${emp.cnicBack ? `<img src="${emp.cnicBack}">` : ''}<div class="tag">CNIC Back</div></div>
       </div>
-      <div class="detail-grid">
-        ${detailRow('Position', emp.position)}
-        ${detailRow('Salary', emp.salary)}
-        ${detailRow('Full Name', emp.fullName)}
-        ${detailRow('Father Name', emp.fatherName)}
-        ${detailRow('DOB', emp.dob)}
-        ${detailRow('CNIC', emp.cnic)}
-        ${detailRow('Gender', emp.gender)}
-        ${detailRow('Joining Date', emp.joiningDate)}
-        ${detailRow('Marital Status', emp.relationshipStatus)}
-        ${detailRow('Children', emp.childrenCount)}
-        ${detailRow('Permanent Address', emp.permanentAddress)}
-        ${detailRow('Temporary Address', emp.temporaryAddress)}
-        ${detailRow('Mobile Number', emp.mobileNumber)}
-        ${detailRow('Emergency Contact', emp.homeNumber)}
-        ${detailRow('Email', emp.email)}
-        ${detailRow('Qualification', emp.qualification)}
-        ${detailRow('Qualification Detail', emp.qualificationDetail)}
-        ${detailRow('Previous Experience', emp.previousExperience)}
-        ${detailRow('Experience Detail', emp.prevExpDetail)}
-        ${detailRow('Previous Salary', emp.prevSalary)}
-        ${detailRow('Reason for Leaving', emp.prevReason)}
-        ${source === 'resigned' ? detailRow('Exit Type', emp.exitType) : ''}
-        ${source === 'resigned' ? detailRow('Exit Date', emp.exitDate) : ''}
-        ${source === 'resigned' ? detailRow('Exit Note', emp.exitNote) : ''}
+      <div class="details-grid">
+        ${renderFieldEntry('Position', emp.position)}
+        ${renderFieldEntry('Salary', emp.salary)}
+        ${renderFieldEntry('Full Name', emp.fullName)}
+        ${renderFieldEntry('Father Name', emp.fatherName)}
+        ${renderFieldEntry('DOB', emp.dob)}
+        ${renderFieldEntry('CNIC', emp.cnic)}
+        ${renderFieldEntry('Gender', emp.gender)}
+        ${renderFieldEntry('Joining Date', emp.joiningDate)}
+        ${renderFieldEntry('Marital Status', emp.relationshipStatus)}
+        ${renderFieldEntry('Children', emp.childrenCount)}
+        ${renderFieldEntry('Permanent Address', emp.permanentAddress)}
+        ${renderFieldEntry('Temporary Address', emp.temporaryAddress)}
+        ${renderFieldEntry('Mobile Number', emp.mobileNumber)}
+        ${renderFieldEntry('Emergency Contact', emp.homeNumber)}
+        ${renderFieldEntry('Email', emp.email)}
+        ${renderFieldEntry('Qualification', emp.qualification)}
+        ${renderFieldEntry('Qualification Detail', emp.qualificationDetail)}
+        ${renderFieldEntry('Previous Experience', emp.previousExperience)}
+        ${renderFieldEntry('Experience Detail', emp.prevExpDetail)}
+        ${renderFieldEntry('Previous Salary', emp.prevSalary)}
+        ${renderFieldEntry('Reason for Leaving', emp.prevReason)}
+        ${source === 'resigned' ? renderFieldEntry('Exit Type', emp.exitType) : ''}
+        ${source === 'resigned' ? renderFieldEntry('Exit Date', emp.exitDate) : ''}
+        ${source === 'resigned' ? renderFieldEntry('Exit Note', emp.exitNote) : ''}
       </div>
-      <div class="modal-actions">
+      <div class="actions-bar">
         <button class="btn cyan" id="print-btn">Print</button>
         <button class="btn cyan" id="pdf-btn">Save as PDF</button>
         <button class="btn cyan" id="edit-btn">Edit Record</button>
-        ${source === 'current' ? `<button class="btn amber" id="resign-btn">Mark Resigned / Retired</button>` : `<button class="btn amber" id="reactivate-btn">Reactivate to Current</button>`}
+        ${source === 'current' ? `<button class="btn amber" id="resign-btn">Mark Resigned</button>` : `<button class="btn amber" id="reactivate-btn">Reactivate</button>`}
         <button class="btn red" id="delete-btn">Delete Record</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
 
-  document.getElementById('detail-close').onclick = () => overlay.remove();
-  document.getElementById('print-btn').onclick = () => askPassword('Enter password to print record', () => openPrintableRecord(emp));
-  document.getElementById('pdf-btn').onclick = () => askPassword('Enter password to save as PDF', () => openPrintableRecord(emp));
-  document.getElementById('edit-btn').onclick = () => askPassword('Enter password to edit record', async () => { overlay.remove(); await openEditForm(emp, source); });
-  document.getElementById('delete-btn').onclick = () => askPassword('Enter password to delete record', () => {
-    if (!confirm('This will move "' + (emp.fullName || 'this record') + '" to Google Drive Trash. Continue?')) return;
-    trashFolder(emp.folderId).then(() => {
-      const arr = source === 'current' ? currentEmployees : resignedEmployees;
+  overlay.querySelector('#detail-close').onclick = () => overlay.remove();
+  overlay.querySelector('#print-btn').onclick = () => promptAuth('Print Authorization', () => triggerPrint(emp));
+  overlay.querySelector('#pdf-btn').onclick = () => promptAuth('PDF Export Authorization', () => triggerPrint(emp));
+  overlay.querySelector('#edit-btn').onclick = () => promptAuth('Edit Authorization', async () => { overlay.remove(); await displayEditModal(emp, source); });
+  overlay.querySelector('#delete-btn').onclick = () => promptAuth('Delete Authorization', () => {
+    if (!confirm(`Trash "${emp.fullName || 'this record'}" in Google Drive?`)) return;
+    Storage.trashEntry(emp.folderId).then(() => {
+      const arr = source === 'current' ? activeEmployees : archivedEmployees;
       const idx = arr.findIndex(e => e.id === id);
       if (idx > -1) arr.splice(idx, 1);
       overlay.remove();
-      toast('Record moved to Drive Trash.');
+      showNotification('Record sent to Trash.');
       render();
-    }).catch(() => toast('Delete failed.', true));
+    }).catch(() => showNotification('Delete operation failed.', true));
   });
 
   if (source === 'current') {
-    document.getElementById('resign-btn').onclick = () => askPassword('Enter password to change status', () => { overlay.remove(); openResignDialog(emp); });
+    overlay.querySelector('#resign-btn').onclick = () => promptAuth('Status Change Authorization', () => { overlay.remove(); displayResignModal(emp); });
   } else {
-    document.getElementById('reactivate-btn').onclick = () => askPassword('Enter password to reactivate', async () => {
+    overlay.querySelector('#reactivate-btn').onclick = () => promptAuth('Reactivation Authorization', async () => {
       try {
-        await moveFolder(emp.folderId, resignedFolderId, currentFolderId);
-        const idx = resignedEmployees.findIndex(e => e.id === id);
+        await Storage.relocateFolder(emp.folderId, folderArchiveId, folderActiveId);
+        const idx = archivedEmployees.findIndex(e => e.id === id);
         if (idx > -1) {
-          const [moved] = resignedEmployees.splice(idx, 1);
+          const [moved] = archivedEmployees.splice(idx, 1);
           moved.status = 'current';
           delete moved.exitType;
           delete moved.exitDate;
           delete moved.exitNote;
-          await updateFileContent(moved.profileFileId, 'application/json', JSON.stringify(profileCopyOf(moved)), true);
-          currentEmployees.push(moved);
+          await Storage.patchFile(moved.profileFileId, 'application/json', JSON.stringify(sanitizeProfile(moved)), true);
+          activeEmployees.push(moved);
         }
         overlay.remove();
-        toast('Employee reactivated to Current.');
-        view = 'current';
+        showNotification('Employee reactivated.');
+        currentScreen = 'current';
         render();
-      } catch(e) {
-        toast('Reactivation failed.', true);
+      } catch (e) {
+        showNotification('Reactivation failed.', true);
       }
     });
   }
 
-  // Load CNIC assets in background
   if (!emp.cnicFront || !emp.cnicBack) {
-    loadAssetsForDetail(emp).then(() => {
-      const thumbs = document.getElementById('detail-doc-thumbs');
+    fetchFullAttachments(emp).then(() => {
+      const thumbs = document.getElementById('detail-thumbs');
       if (thumbs) {
         thumbs.innerHTML = `
-          <div>${emp.picture ? `<img src="${emp.picture}">` : ''}<div class="lbl">Picture</div></div>
-          <div>${emp.cnicFront ? `<img src="${emp.cnicFront}">` : ''}<div class="lbl">CNIC Front</div></div>
-          <div>${emp.cnicBack ? `<img src="${emp.cnicBack}">` : ''}<div class="lbl">CNIC Back</div></div>`;
+          <div>${emp.picture ? `<img src="${emp.picture}">` : ''}<div class="tag">Picture</div></div>
+          <div>${emp.cnicFront ? `<img src="${emp.cnicFront}">` : ''}<div class="tag">CNIC Front</div></div>
+          <div>${emp.cnicBack ? `<img src="${emp.cnicBack}">` : ''}<div class="tag">CNIC Back</div></div>`;
       }
     });
   }
 }
 
-function openResignDialog(emp) {
+function displayResignModal(emp) {
   const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
+  overlay.className = 'modal-backdrop';
   overlay.innerHTML = `
-    <div class="panel pw-modal-box" style="max-width:420px;text-align:left;">
-      <div class="eyebrow">STATUS CHANGE</div>
-      <h3 style="margin:8px 0 16px;">${esc(emp.fullName)}</h3>
+    <div class="card auth-dialog" style="max-width:420px;text-align:left;">
+      <div class="sub-header">STATUS CHANGE</div>
+      <h3 style="margin:8px 0 16px;">${sanitize(emp.fullName)}</h3>
       <div class="field"><label>Type</label>
         <div class="radio-group">
           <label class="radio-opt"><input type="radio" name="exit-type" value="Resigned" checked> Resigned</label>
@@ -1153,68 +972,72 @@ function openResignDialog(emp) {
     </div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('#exit-cancel').onclick = () => overlay.remove();
-  const exitDateEl = overlay.querySelector('#exit-date');
-  exitDateEl.addEventListener('click', () => {
-    if (typeof exitDateEl.showPicker === 'function') {
-      try { exitDateEl.showPicker(); } catch(e) {}
+
+  const exitDate = overlay.querySelector('#exit-date');
+  exitDate.addEventListener('click', () => {
+    if (typeof exitDate.showPicker === 'function') {
+      try { exitDate.showPicker(); } catch (e) {}
     }
   });
+
   overlay.querySelector('#exit-confirm').onclick = async () => {
     const type = overlay.querySelector('input[name="exit-type"]:checked').value;
-    const date = overlay.querySelector('#exit-date').value.trim();
+    const date = exitDate.value.trim();
     const note = overlay.querySelector('#exit-note').value.trim();
     const btn = overlay.querySelector('#exit-confirm');
     btn.disabled = true;
     btn.textContent = 'Updating...';
+
     try {
-      await moveFolder(emp.folderId, currentFolderId, resignedFolderId);
-      const idx = currentEmployees.findIndex(e => e.id === emp.id);
+      await Storage.relocateFolder(emp.folderId, folderActiveId, folderArchiveId);
+      const idx = activeEmployees.findIndex(e => e.id === emp.id);
       if (idx > -1) {
-        const [moved] = currentEmployees.splice(idx, 1);
+        const [moved] = activeEmployees.splice(idx, 1);
         moved.status = 'resigned';
         moved.exitType = type;
         moved.exitDate = date;
         moved.exitNote = note;
-        await updateFileContent(moved.profileFileId, 'application/json', JSON.stringify(profileCopyOf(moved)), true);
-        resignedEmployees.push(moved);
+        await Storage.patchFile(moved.profileFileId, 'application/json', JSON.stringify(sanitizeProfile(moved)), true);
+        archivedEmployees.push(moved);
       }
       overlay.remove();
-      toast(emp.fullName + ' moved to Resigned/Retired.');
-      view = 'resigned';
+      showNotification(`${emp.fullName} archived.`);
+      currentScreen = 'resigned';
       render();
-    } catch(e) {
-      toast('Status update failed.', true);
+    } catch (e) {
+      showNotification('Status change failed.', true);
       btn.disabled = false;
       btn.textContent = 'Confirm';
     }
   };
 }
 
-async function openEditForm(emp, source) {
-  await loadAssetsForDetail(emp);
+async function displayEditModal(emp, source) {
+  await fetchFullAttachments(emp);
   const store = Object.assign({}, emp);
   const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
+  overlay.className = 'modal-backdrop';
   overlay.innerHTML = `
-    <div class="panel modal-box">
-      <span class="modal-close" id="edit-close">&times;</span>
-      <div class="eyebrow">EDIT RECORD</div>
-      <h2 class="glow" style="margin:6px 0 16px;">${esc(emp.fullName || '(No name)')}</h2>
-      ${formFieldsHTML(emp)}
-      <div class="form-actions">
+    <div class="card modal-dialog">
+      <span class="modal-dismiss" id="edit-close">&times;</span>
+      <div class="sub-header">EDIT RECORD</div>
+      <h2 class="accent-text" style="margin:6px 0 16px;">${sanitize(emp.fullName || '(No name)')}</h2>
+      ${renderFormMarkup(emp)}
+      <div class="form-buttons">
         <button class="btn" id="save-edit-btn">Save Changes</button>
         <button class="btn cyan" id="cancel-edit-btn">Cancel</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
-  wireFormInteractions(store);
+  bindFormEvents(store);
+
   overlay.querySelector('#edit-close').onclick = () => overlay.remove();
   overlay.querySelector('#cancel-edit-btn').onclick = () => overlay.remove();
   overlay.querySelector('#save-edit-btn').onclick = async () => {
-    const data = collectFormData(store);
-    const missing = validateForm(data);
+    const data = parseFormData(store);
+    const missing = validateRecordForm(data);
     if (missing.length) {
-      toast('Required: ' + missing.join(', '), true);
+      showNotification(`Missing: ${missing.join(', ')}`, true);
       return;
     }
     data.id = emp.id;
@@ -1224,37 +1047,233 @@ async function openEditForm(emp, source) {
     data.pictureFileId = emp.pictureFileId;
     data.cnicFrontFileId = emp.cnicFrontFileId;
     data.cnicBackFileId = emp.cnicBackFileId;
+
     if (source === 'resigned') {
       data.exitType = emp.exitType;
       data.exitDate = emp.exitDate;
       data.exitNote = emp.exitNote;
     }
+
     const btn = overlay.querySelector('#save-edit-btn');
     btn.disabled = true;
-    btn.textContent = 'Saving Changes...';
+    btn.textContent = 'Saving...';
+
     try {
-      await updateEmployeeInDrive(data);
-      const arr = source === 'current' ? currentEmployees : resignedEmployees;
+      await modifyEmployee(data);
+      const arr = source === 'current' ? activeEmployees : archivedEmployees;
       const idx = arr.findIndex(e => e.id === emp.id);
       if (idx > -1) arr[idx] = data;
       overlay.remove();
-      toast('Record updated on Drive.');
+      showNotification('Changes saved to Drive.');
       render();
-    } catch(e) {
-      toast('Update failed.', true);
+    } catch (e) {
+      showNotification('Save failed.', true);
       btn.disabled = false;
       btn.textContent = 'Save Changes';
     }
   };
 }
 
-function render(loadingMsg) {
-  if (view === 'pinlock') renderPinLock();
-  else if (view === 'login') renderLogin();
-  else if (view === 'loading') renderLoading(loadingMsg);
-  else if (view === 'dashboard') renderDashboard();
-  else if (view === 'new') renderNewEmployee();
-  else if (view === 'current') renderCurrentList();
-  else if (view === 'resigned') renderResignedList();
+function render(statusMessage = '') {
+  if (currentScreen === 'pinlock') {
+    const isLocked = lockoutExpiryTimestamp > Date.now();
+    root.innerHTML = `
+      <div class="card auth-box">
+        <div class="sub-header">AUTHENTICATION</div>
+        <h1 class="accent-text" style="font-size:22px;margin:8px 0 24px;">EMPLOYEE RECORD SYSTEM<span class="cursor-blink"></span></h1>
+        <div class="meta-text" style="font-size:13px;margin-bottom:14px;">Enter authorization PIN to unlock.</div>
+        <div class="field">
+          <input type="password" id="pin-input" placeholder="Enter PIN" autocomplete="off" ${isLocked ? 'disabled' : ''}>
+        </div>
+        <div id="pin-error" style="color:var(--danger);font-size:11.5px;min-height:16px;margin:6px 0 4px;">
+          ${isLocked ? `Locked. Cooldown: ${Math.ceil((lockoutExpiryTimestamp - Date.now()) / 1000)}s` : ''}
+        </div>
+        <button class="btn" id="pin-submit" style="width:100%;margin-top:8px;" ${isLocked ? 'disabled' : ''}>Unlock</button>
+      </div>`;
+
+    const input = document.getElementById('pin-input');
+    if (!isLocked && input) input.focus();
+
+    async function checkPin() {
+      if (isLocked) return;
+      const hashed = await computeSha256(input.value);
+      if (hashed === CONFIG.PIN_HASH) {
+        invalidPinCounter = 0;
+        trySessionRestore();
+      } else {
+        invalidPinCounter++;
+        if (invalidPinCounter >= 3) {
+          lockoutExpiryTimestamp = Date.now() + 60000;
+          showNotification('Multiple invalid attempts. Cooldown 60s.', true);
+        }
+        render();
+      }
+    }
+
+    document.getElementById('pin-submit').onclick = checkPin;
+    input?.addEventListener('keydown', e => { if (e.key === 'Enter') checkPin(); });
+  }
+
+  else if (currentScreen === 'login') {
+    root.innerHTML = `
+      <div class="card auth-box">
+        <div class="sub-header">SECURE ACCESS</div>
+        <h1 class="accent-text" style="font-size:22px;margin:8px 0 24px;">EMPLOYEE RECORD SYSTEM<span class="cursor-blink"></span></h1>
+        <div class="meta-text" style="font-size:13px;margin-bottom:16px;">Connect with authorized Google account to sync Drive.</div>
+        <button class="btn" id="google-auth-btn" style="padding:12px 26px;">Sign in with Google</button>
+      </div>`;
+    document.getElementById('google-auth-btn').onclick = () => tokenClient?.requestAccessToken({ prompt: 'consent' });
+  }
+
+  else if (currentScreen === 'loading') {
+    root.innerHTML = `
+      <div class="loading-wrap">
+        <div class="sub-header">SYNCHRONIZING</div>
+        <div class="spinner"></div>
+        <div class="meta-text" style="font-size:13px;">${sanitize(statusMessage || 'Loading...')}</div>
+      </div>`;
+  }
+
+  else if (currentScreen === 'dashboard') {
+    root.innerHTML = renderHeaderBar() + `
+      <div id="main-container">
+        <div class="stats-grid">
+          <div class="card stat-item" id="card-active">
+            <div class="icon">🗂️</div>
+            <div class="lbl">Current Employees</div>
+            <div class="val">${activeEmployees.length}</div>
+            <div class="meta-text">Active staff members</div>
+          </div>
+          <div class="card stat-item" id="card-new">
+            <div class="icon">➕</div>
+            <div class="lbl">New Employee</div>
+            <div class="val">+</div>
+            <div class="meta-text">Register new profile</div>
+          </div>
+          <div class="card stat-item" id="card-archived">
+            <div class="icon">📁</div>
+            <div class="lbl">Resigned / Retired</div>
+            <div class="val">${archivedEmployees.length}</div>
+            <div class="meta-text">Archived profiles</div>
+          </div>
+        </div>
+      </div>`;
+
+    document.getElementById('signout-btn').onclick = () => {
+      promptAuth('Confirm Logout', () => {
+        purgeSession();
+        Storage.setToken(null);
+        currentSessionUser = null;
+        activeEmployees = [];
+        archivedEmployees = [];
+        currentScreen = 'login';
+        render();
+        showNotification('Signed out.');
+      });
+    };
+
+    document.getElementById('card-active').onclick = () => { currentScreen = 'current'; render(); };
+    document.getElementById('card-new').onclick = () => promptAuth('New Registration', () => { currentScreen = 'new'; render(); });
+    document.getElementById('card-archived').onclick = () => { currentScreen = 'resigned'; render(); };
+  }
+
+  else if (currentScreen === 'new') {
+    const store = {};
+    root.innerHTML = renderHeaderBar() + `
+      <div id="main-container">
+        <div class="view-heading"><span class="nav-link" id="nav-dash">&larr; Dashboard</span></div>
+        <h2 class="accent-text" style="margin:10px 0 4px;">New Employee Record</h2>
+        <div class="meta-text">Mandatory fields are marked with *</div>
+        <div class="card form-body">
+          ${renderFormMarkup()}
+          <div class="form-buttons">
+            <button class="btn" id="save-new-btn">Save Employee</button>
+            <button class="btn cyan" id="cancel-new-btn">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+
+    document.getElementById('signout-btn').onclick = () => {
+      purgeSession();
+      Storage.setToken(null);
+      currentScreen = 'login';
+      render();
+    };
+
+    bindFormEvents(store);
+    document.getElementById('nav-dash').onclick = () => { currentScreen = 'dashboard'; render(); };
+    document.getElementById('cancel-new-btn').onclick = () => { currentScreen = 'dashboard'; render(); };
+
+    document.getElementById('save-new-btn').onclick = async () => {
+      const data = parseFormData(store);
+      const errors = validateRecordForm(data);
+      if (errors.length) {
+        showNotification(`Missing: ${errors.join(', ')}`, true);
+        return;
+      }
+      const btn = document.getElementById('save-new-btn');
+      btn.disabled = true;
+      btn.textContent = 'Saving to Drive...';
+
+      try {
+        data.id = generateId();
+        data.status = 'current';
+        const created = await insertEmployee(data);
+        activeEmployees.push(created);
+        showNotification('Employee saved successfully.');
+        currentScreen = 'current';
+        render();
+      } catch (err) {
+        showNotification('Drive storage failure.', true);
+        btn.disabled = false;
+        btn.textContent = 'Save Employee';
+      }
+    };
+  }
+
+  else if (currentScreen === 'current' || currentScreen === 'resigned') {
+    const isCurrent = currentScreen === 'current';
+    const sourceList = isCurrent ? activeEmployees : archivedEmployees;
+    const query = isCurrent ? filterCurrentQuery : filterArchiveQuery;
+    const filtered = filterRecords(sourceList, query);
+
+    root.innerHTML = renderHeaderBar() + `
+      <div id="main-container">
+        <div class="view-heading"><span class="nav-link" id="nav-dash">&larr; Dashboard</span></div>
+        <h2 class="accent-text" style="margin:10px 0 4px;">${isCurrent ? 'Current Employees' : 'Resigned / Retired Archives'} (${sourceList.length})</h2>
+        <div class="search-wrap"><input id="search-input" placeholder="Search by name or CNIC..." value="${sanitize(query)}"></div>
+        <div id="records-wrap">${renderEmployeeGrid(filtered, isCurrent ? 'active' : 'archived')}</div>
+      </div>`;
+
+    document.getElementById('signout-btn').onclick = () => {
+      purgeSession();
+      Storage.setToken(null);
+      currentScreen = 'login';
+      render();
+    };
+
+    document.getElementById('nav-dash').onclick = () => { currentScreen = 'dashboard'; render(); };
+    const search = document.getElementById('search-input');
+
+    search.addEventListener('input', e => {
+      if (isCurrent) filterCurrentQuery = e.target.value;
+      else filterArchiveQuery = e.target.value;
+
+      document.getElementById('records-wrap').innerHTML = renderEmployeeGrid(
+        filterRecords(sourceList, e.target.value),
+        isCurrent ? 'active' : 'archived'
+      );
+      wireCards(isCurrent ? 'current' : 'resigned');
+    });
+
+    wireCards(isCurrent ? 'current' : 'resigned');
+  }
 }
+
+function wireCards(source) {
+  document.querySelectorAll('.employee-card').forEach(card => {
+    card.onclick = () => displayDetailModal(card.getAttribute('data-id'), source);
+  });
+}
+
 render();
