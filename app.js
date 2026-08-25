@@ -1,8 +1,7 @@
 const CONFIG = Object.freeze({
   CLIENT_ID: "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com",
   SCOPES: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email",
-  // Obfuscated signature for authorization check (No plaintext PIN)
-  AUTH_SIG: 1690554,
+  APP_PIN: "6666",
   AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com"],
   SESSION_STORAGE_KEY: "optp_active_session"
 });
@@ -151,15 +150,6 @@ let filterArchiveQuery = "";
 let isSilentRefreshActive = false;
 
 const root = document.getElementById('root');
-
-function verifyInputToken(val) {
-  let hash = 0;
-  for (let i = 0; i < val.length; i++) {
-    hash = ((hash << 5) - hash) + val.charCodeAt(i);
-    hash |= 0;
-  }
-  return hash === CONFIG.AUTH_SIG;
-}
 
 function sanitize(input) {
   return String(input == null ? '' : input)
@@ -492,7 +482,7 @@ function promptAuth(label, onSuccess) {
   input.focus();
 
   function verify() {
-    if (verifyInputToken(input.value)) {
+    if (input.value === CONFIG.APP_PIN) {
       overlay.remove();
       onSuccess();
     } else {
@@ -1093,7 +1083,7 @@ function render(statusMessage = '') {
     if (input) input.focus();
 
     function checkPin() {
-      if (verifyInputToken(input.value)) {
+      if (input.value === CONFIG.APP_PIN) {
         trySessionRestore();
       } else {
         document.getElementById('pin-error').textContent = 'Incorrect PIN.';
