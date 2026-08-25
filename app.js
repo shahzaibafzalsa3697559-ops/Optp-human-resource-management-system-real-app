@@ -1,6 +1,4 @@
-/* =====================================================================
-   OPTP Employee Record System - Core Engine
-   ===================================================================== */
+
 const CLIENT_ID = "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com";
 const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
 const APP_PASSWORD = "6666";
@@ -15,6 +13,8 @@ let resignedEmployees = [];
 let view = "pinlock";
 let searchQueryCurrent = "";
 let searchQueryResigned = "";
+let silentAttemptInProgress = false;
+let silentAttemptEmail = null;
 
 const app = document.getElementById('app');
 
@@ -64,14 +64,19 @@ function initGis() {
     client_id: CLIENT_ID,
     scope: SCOPES,
     callback: async (resp) => {
+      const wasSilent = silentAttemptInProgress;
+      const expectedEmail = silentAttemptEmail;
+      silentAttemptInProgress = false;
+      silentAttemptEmail = null;
       if (resp.error) {
+        if (wasSilent) { view = 'login'; render(); return; }
         toast('Login failed: ' + resp.error, true);
         view = 'login';
         render();
         return;
       }
       accessToken = resp.access_token;
-      await afterLogin(resp.expires_in);
+      await afterLogin(wasSilent, expectedEmail, resp.expires_in);
     }
   });
 }
@@ -89,15 +94,60 @@ window.addEventListener('load', () => {
 
 async function attemptAutoLogin() {
   const session = loadSession();
+
+  // 1. Agar cached token abhi valid hai to direct use karein
   if (session && session.token && session.expiresAt > Date.now()) {
     view = 'loading';
-    render('Restoring session...');
+    render('Restoring your session...');
     accessToken = session.token;
-    await afterLogin(null, true);
+    await afterLogin(true, session.email, null, true);
     return;
   }
-  view = 'login';
-  render();
+
+  // 2. Agar token expire ho gaya hai to background mein silent refresh karein
+  const savedEmail = session ? session.email : null;
+  if (!savedEmail) {
+    view = 'login';
+    render();
+    return;
+  }
+
+  view = 'loading';
+  render('Restoring your session...');
+  silentAttemptInProgress = true;
+  silentAttemptEmail = savedEmail;
+  let settled = false;
+
+  const fallbackTimer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      silentAttemptInProgress = false;
+      silentAttemptEmail = null;
+      view = 'login';
+      render();
+    }
+  }, 6000);
+
+  const originalCallback = tokenClient.callback;
+  tokenClient.callback = (resp) => {
+    settled = true;
+    clearTimeout(fallbackTimer);
+    tokenClient.callback = originalCallback;
+    originalCallback(resp);
+  };
+
+  try {
+    tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail });
+  } catch(e) {
+    if (!settled) {
+      settled = true;
+      clearTimeout(fallbackTimer);
+      silentAttemptInProgress = false;
+      silentAttemptEmail = null;
+      view = 'login';
+      render();
+    }
+  }
 }
 
 function loginWithGoogle() {
@@ -124,7 +174,7 @@ function logoutFlow() {
   });
 }
 
-async function afterLogin(expiresInSeconds, isFromCache) {
+async function afterLogin(isSilent, expectedEmail, expiresInSeconds, isFromCache) {
   view = 'loading';
   render('Verifying Google Account...');
   try {
@@ -136,9 +186,17 @@ async function afterLogin(expiresInSeconds, isFromCache) {
       accessToken = null;
       view = 'login';
       render();
+      if (!isSilent) toast('Session expired. Please sign in again.', true);
       return;
     }
     const info = await res.json();
+    if (isSilent && expectedEmail && info.email !== expectedEmail) {
+      clearSession();
+      accessToken = null;
+      view = 'login';
+      render();
+      return;
+    }
     userEmail = info.email;
     if (!isFromCache) saveSession(userEmail, accessToken, expiresInSeconds);
     
@@ -153,18 +211,56 @@ async function afterLogin(expiresInSeconds, isFromCache) {
     view = 'dashboard';
     render();
   } catch(e) {
+    if (isSilent) {
+      accessToken = null;
+      view = 'login';
+      render();
+      return;
+    }
     toast('Error connecting to Google Drive.', true);
     view = 'login';
     render();
   }
 }
 
-async function driveFetch(url, options = {}) {
+function silentRefreshToken() {
+  return new Promise((resolve) => {
+    if (!tokenClient || !userEmail) { resolve(false); return; }
+    let settled = false;
+    const fallbackTimer = setTimeout(() => { if (!settled) { settled = true; resolve(false); } }, 6000);
+    const originalCallback = tokenClient.callback;
+    tokenClient.callback = (resp) => {
+      settled = true;
+      clearTimeout(fallbackTimer);
+      tokenClient.callback = originalCallback;
+      if (resp.error) { resolve(false); return; }
+      accessToken = resp.access_token;
+      saveSession(userEmail, accessToken, resp.expires_in);
+      resolve(true);
+    };
+    try {
+      tokenClient.requestAccessToken({ prompt: 'none', hint: userEmail });
+    } catch(e) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(fallbackTimer);
+        tokenClient.callback = originalCallback;
+        resolve(false);
+      }
+    }
+  });
+}
+
+async function driveFetch(url, options = {}, _isRetry) {
   options.headers = Object.assign({}, options.headers || {}, {
     Authorization: 'Bearer ' + accessToken
   });
   const res = await fetch(url, options);
   if (res.status === 401) {
+    if (!_isRetry) {
+      const refreshed = await silentRefreshToken();
+      if (refreshed) return driveFetch(url, options, true);
+    }
     clearSession();
     accessToken = null;
     view = 'login';
