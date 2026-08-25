@@ -3,8 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OPTP - Employee Record System</title>
+<title>OPTP - Employee Record System | Option A Hardened</title>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
   :root {
     --bg: #05080a;
@@ -73,6 +75,7 @@
   .file-card { padding: 14px 10px 12px; text-align: center; cursor: pointer; }
   .file-card:hover { border-color: var(--green-dim); box-shadow: 0 0 16px rgba(57,255,138,0.15); }
   .file-thumb { width: 74px; height: 74px; border-radius: 6px; object-fit: cover; margin: 0 auto 10px; border: 1px solid var(--line); display: block; background: #081010; }
+  .file-thumb.lazy-thumb { object-fit: cover; }
   .file-thumb.placeholder { display: flex; align-items: center; justify-content: center; font-size: 26px; color: var(--text-dim); }
   .file-name { font-size: 12.5px; color: var(--text); word-break: break-word; }
   .file-id { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; }
@@ -118,39 +121,20 @@
 <div id="app"></div>
 
 <script>
-const CLIENT_ID = "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com";
-const SCOPES = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
-const APP_PASSWORD = "6666";
-const SESSION_KEY = "optp_session_v1";
+const CONFIG = Object.freeze({
+  CLIENT_ID: "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com",
+  SCOPES: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email",
+  // IMPORTANT: replace the placeholder below with the exact Gmail account(s) allowed to use this app.
+  // Example: AUTHORIZED_EMAILS: ["manager@example.com", "admin@example.com"]
+  AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com"],
+  SESSION_EMAIL_KEY: "optp_authorized_email_v2",
+  TOKEN_REFRESH_TIMEOUT_MS: 7000,
+  MAX_IMAGE_CACHE_ITEMS: 60
+});
+const CLIENT_ID = CONFIG.CLIENT_ID;
+const SCOPES = CONFIG.SCOPES;
 
-(function() {
-  const canvas = document.getElementById('matrix-bg');
-  const ctx = canvas.getContext('2d');
-  let w, h, cols, drops;
-  const chars = "010101ABCDEF0123456789";
-  function resize() {
-    w = canvas.width = window.innerWidth;
-    h = canvas.height = window.innerHeight;
-    cols = Math.floor(w / 16);
-    drops = new Array(cols).fill(1);
-  }
-  window.addEventListener('resize', resize);
-  resize();
-  function draw() {
-    ctx.fillStyle = 'rgba(5,8,10,0.08)';
-    ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = '#39ff8a';
-    ctx.font = '14px monospace';
-    for (let i = 0; i < drops.length; i++) {
-      const text = chars[Math.floor(Math.random() * chars.length)];
-      ctx.fillText(text, i * 16, drops[i] * 16);
-      if (drops[i] * 16 > h && Math.random() > 0.975) drops[i] = 0;
-      drops[i]++;
-    }
-    requestAnimationFrame(draw);
-  }
-  draw();
-})();
+document.getElementById('matrix-bg').style.display = 'none';
 
 let accessToken = null;
 let tokenClient = null;
@@ -158,11 +142,13 @@ let userEmail = null;
 let rootFolderId, currentFolderId, resignedFolderId;
 let currentEmployees = [];
 let resignedEmployees = [];
-let view = "pinlock";
+let view = "login";
 let searchQueryCurrent = "";
 let searchQueryResigned = "";
 let silentAttemptInProgress = false;
 let silentAttemptEmail = null;
+const assetCache = new Map();
+const assetPromises = new Map();
 
 const app = document.getElementById('app');
 
@@ -187,24 +173,25 @@ function uid() {
   return 'EMP-' + Date.now() + '-' + Math.floor(Math.random() * 9000 + 1000);
 }
 
-function saveSession(email, token, expiresInSeconds) {
-  try {
-    const expiresAt = Date.now() + (Math.max(60, (expiresInSeconds || 3300) - 120)) * 1000;
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ email, token, expiresAt }));
-  } catch(e) {}
+function saveSession(email) {
+  try { sessionStorage.setItem(CONFIG.SESSION_EMAIL_KEY, email || ''); } catch(e) {}
 }
 
-function loadSession() {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch(e) {
-    return null;
-  }
+function loadSessionEmail() {
+  try { return sessionStorage.getItem(CONFIG.SESSION_EMAIL_KEY) || ''; } catch(e) { return ''; }
 }
 
 function clearSession() {
-  try { localStorage.removeItem(SESSION_KEY); } catch(e) {}
+  try { sessionStorage.removeItem(CONFIG.SESSION_EMAIL_KEY); } catch(e) {}
+}
+
+function isAuthorizedEmail(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  return CONFIG.AUTHORIZED_EMAILS.some(x => String(x).trim().toLowerCase() === normalized);
+}
+
+function assertConfigured() {
+  return CONFIG.AUTHORIZED_EMAILS.length > 0 && !CONFIG.AUTHORIZED_EMAILS.includes('REPLACE-WITH-AUTHORIZED-EMAIL@gmail.com');
 }
 
 function initGis() {
@@ -232,137 +219,69 @@ window.addEventListener('load', () => {
     if (window.google && google.accounts && google.accounts.oauth2) {
       clearInterval(check);
       initGis();
-      view = 'pinlock';
-      render();
+      const savedEmail = loadSessionEmail();
+      view = savedEmail ? 'loading' : 'login';
+      render(savedEmail ? 'Restoring Google session...' : undefined);
+      if (savedEmail) attemptSilentLogin(savedEmail);
     }
   }, 150);
 });
 
-async function attemptAutoLogin() {
-  const session = loadSession();
-  if (session && session.token && session.expiresAt > Date.now()) {
-    view = 'loading';
-    render('Restoring your session...');
-    accessToken = session.token;
-    await afterLogin(true, session.email, null, true);
-    return;
-  }
-  const savedEmail = session ? session.email : null;
-  if (!savedEmail) {
-    view = 'login';
-    render();
-    return;
-  }
-  view = 'loading';
-  render('Restoring your session...');
+async function attemptSilentLogin(savedEmail) {
+  if (!isAuthorizedEmail(savedEmail)) { clearSession(); view = 'login'; render(); return; }
   silentAttemptInProgress = true;
   silentAttemptEmail = savedEmail;
   let settled = false;
   const fallbackTimer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      silentAttemptInProgress = false;
-      silentAttemptEmail = null;
-      view = 'login';
-      render();
-    }
-  }, 6000);
+    if (!settled) { settled = true; silentAttemptInProgress = false; silentAttemptEmail = null; view = 'login'; render(); }
+  }, CONFIG.TOKEN_REFRESH_TIMEOUT_MS);
   const originalCallback = tokenClient.callback;
   tokenClient.callback = (resp) => {
-    settled = true;
-    clearTimeout(fallbackTimer);
-    tokenClient.callback = originalCallback;
-    originalCallback(resp);
+    settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; originalCallback(resp);
   };
-  try {
-    tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail });
-  } catch(e) {
-    if (!settled) {
-      settled = true;
-      clearTimeout(fallbackTimer);
-      silentAttemptInProgress = false;
-      silentAttemptEmail = null;
-      view = 'login';
-      render();
-    }
-  }
+  try { tokenClient.requestAccessToken({ prompt: 'none', hint: savedEmail }); }
+  catch(e) { if (!settled) { settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; silentAttemptInProgress = false; silentAttemptEmail = null; view = 'login'; render(); } }
 }
 
 function loginWithGoogle() {
-  if (!tokenClient) {
-    toast('Authentication service initializing...', true);
+  if (!assertConfigured()) {
+    toast('Set AUTHORIZED_EMAILS in CONFIG before using the system.', true);
     return;
   }
+  if (!tokenClient) { toast('Authentication service initializing...', true); return; }
   tokenClient.requestAccessToken({ prompt: 'consent' });
 }
 
 function logoutFlow() {
-  askPassword('Confirm Logout', () => {
-    if (accessToken) {
-      google.accounts.oauth2.revoke(accessToken, () => {});
-    }
-    clearSession();
-    accessToken = null;
-    userEmail = null;
-    currentEmployees = [];
-    resignedEmployees = [];
-    view = 'login';
-    render();
-    toast('Logged out.');
-  });
+  if (!confirm('Log out from the Employee Record System?')) return;
+  if (accessToken) { try { google.accounts.oauth2.revoke(accessToken, () => {}); } catch(e) {} }
+  clearSession(); accessToken = null; userEmail = null; currentEmployees = []; resignedEmployees = []; assetCache.clear();
+  view = 'login'; render(); toast('Logged out.');
 }
 
 async function afterLogin(isSilent, expectedEmail, expiresInSeconds, isFromCache) {
-  view = 'loading';
-  render('Verifying Google account...');
+  view = 'loading'; render('Verifying Google account...');
   try {
-    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: 'Bearer ' + accessToken }
-    });
-    if (!res.ok) {
-      clearSession();
-      accessToken = null;
-      view = 'login';
-      render();
-      if (!isSilent) toast('Session expired. Please sign in again.', true);
-      return;
-    }
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + accessToken } });
+    if (!res.ok) { accessToken = null; view = 'login'; render(); if (!isSilent) toast('Google session could not be verified.', true); return; }
     const info = await res.json();
-    if (!info.email || !info.email.endsWith('@gmail.com')) {
-      clearSession();
-      accessToken = null;
-      view = 'login';
-      render();
-      if (!isSilent) toast('Please sign in with a valid Gmail account.', true);
-      return;
+    const email = String(info.email || '').trim().toLowerCase();
+    if (!email || !isAuthorizedEmail(email)) {
+      try { google.accounts.oauth2.revoke(accessToken, () => {}); } catch(e) {}
+      clearSession(); accessToken = null; userEmail = null; view = 'login'; render();
+      toast('This Google account is not authorized for this system.', true); return;
     }
-    if (isSilent && expectedEmail && info.email !== expectedEmail) {
-      clearSession();
-      accessToken = null;
-      view = 'login';
-      render();
-      return;
+    if (isSilent && expectedEmail && email !== String(expectedEmail).toLowerCase()) {
+      clearSession(); accessToken = null; userEmail = null; view = 'login'; render(); return;
     }
-    userEmail = info.email;
-    if (!isFromCache) saveSession(userEmail, accessToken, expiresInSeconds);
-    view = 'loading';
-    render('Configuring Storage Folders...');
-    await setupDriveStructure();
-    view = 'loading';
-    render('Loading employee records...');
-    await loadAllFromDrive();
-    view = 'dashboard';
-    render();
+    userEmail = email; saveSession(email);
+    view = 'loading'; render('Configuring Storage Folders...'); await setupDriveStructure();
+    view = 'loading'; render('Loading employee records...'); await loadAllFromDrive();
+    view = 'dashboard'; render();
   } catch(e) {
-    if (isSilent) {
-      accessToken = null;
-      view = 'login';
-      render();
-      return;
-    }
-    toast('Connection error with Google Drive.', true);
-    view = 'login';
-    render();
+    console.error(e);
+    if (isSilent) { accessToken = null; view = 'login'; render(); return; }
+    toast('Connection error with Google Drive.', true); view = 'login'; render();
   }
 }
 
@@ -370,29 +289,15 @@ function silentRefreshToken() {
   return new Promise((resolve) => {
     if (!tokenClient || !userEmail) { resolve(false); return; }
     let settled = false;
-    const fallbackTimer = setTimeout(() => {
-      if (!settled) { settled = true; resolve(false); }
-    }, 6000);
+    const fallbackTimer = setTimeout(() => { if (!settled) { settled = true; resolve(false); } }, CONFIG.TOKEN_REFRESH_TIMEOUT_MS);
     const originalCallback = tokenClient.callback;
     tokenClient.callback = (resp) => {
-      settled = true;
-      clearTimeout(fallbackTimer);
-      tokenClient.callback = originalCallback;
+      settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback;
       if (resp.error) { resolve(false); return; }
-      accessToken = resp.access_token;
-      saveSession(userEmail, accessToken, resp.expires_in);
-      resolve(true);
+      accessToken = resp.access_token; resolve(true);
     };
-    try {
-      tokenClient.requestAccessToken({ prompt: 'none', hint: userEmail });
-    } catch(e) {
-      if (!settled) {
-        settled = true;
-        clearTimeout(fallbackTimer);
-        tokenClient.callback = originalCallback;
-        resolve(false);
-      }
-    }
+    try { tokenClient.requestAccessToken({ prompt: 'none', hint: userEmail }); }
+    catch(e) { if (!settled) { settled = true; clearTimeout(fallbackTimer); tokenClient.callback = originalCallback; resolve(false); } }
   });
 }
 
@@ -419,12 +324,16 @@ async function driveFetch(url, options, _isRetry) {
     throw new Error('401 Unauthorized');
   }
 
+  if (res.status === 429 || res.status === 503) {
+    if (!_isRetry) {
+      const retryAfter = Number(res.headers.get('Retry-After') || 1);
+      await new Promise(r => setTimeout(r, Math.min(5000, Math.max(500, retryAfter * 1000))));
+      return driveFetch(url, options, true);
+    }
+  }
   if (!res.ok) {
     let detail = '';
-    try {
-      const errJson = await res.clone().json();
-      detail = errJson?.error?.message || errJson?.error?.status || '';
-    } catch(e) {}
+    try { const errJson = await res.clone().json(); detail = errJson?.error?.message || errJson?.error?.status || ''; } catch(e) {}
     throw new Error('Drive API status ' + res.status + (detail ? ': ' + detail : ''));
   }
   return res;
@@ -549,41 +458,62 @@ async function getFileText(fileId) {
 }
 
 async function getFileDataUrl(fileId) {
-  const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
-  const blob = await res.blob();
-  return new Promise(resolve => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(blob);
-  });
+  if (!fileId) return '';
+  if (assetCache.has(fileId)) return assetCache.get(fileId);
+  if (assetPromises.has(fileId)) return assetPromises.get(fileId);
+  const promise = (async () => {
+    const res = await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`);
+    const blob = await res.blob();
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(blob);
+    });
+    assetCache.set(fileId, dataUrl);
+    while (assetCache.size > CONFIG.MAX_IMAGE_CACHE_ITEMS) assetCache.delete(assetCache.keys().next().value);
+    assetPromises.delete(fileId);
+    return dataUrl;
+  })().catch(err => { assetPromises.delete(fileId); throw err; });
+  assetPromises.set(fileId, promise);
+  return promise;
+}
+
+async function loadEmployeeAssets(emp, includeAll = true) {
+  const tasks = [];
+  if (emp.pictureFileId && !emp.picture) tasks.push(getFileDataUrl(emp.pictureFileId).then(v => emp.picture = v));
+  if (includeAll && emp.cnicFrontFileId && !emp.cnicFront) tasks.push(getFileDataUrl(emp.cnicFrontFileId).then(v => emp.cnicFront = v));
+  if (includeAll && emp.cnicBackFileId && !emp.cnicBack) tasks.push(getFileDataUrl(emp.cnicBackFileId).then(v => emp.cnicBack = v));
+  await Promise.all(tasks);
+  return emp;
 }
 
 async function loadEmployeesFromFolder(parentId) {
   const folders = await listChildFolders(parentId);
-  return Promise.all(folders.map(async (folder) => {
-    const children = await listChildFiles(folder.id);
-    const profileFile = children.find(f => f.name === 'profile.json');
-    const pictureFile = children.find(f => f.name === 'picture.jpg');
-    const cnicFrontFile = children.find(f => f.name === 'cnic_front.jpg');
-    const cnicBackFile = children.find(f => f.name === 'cnic_back.jpg');
-    let data = {};
-    if (profileFile) {
-      try { data = JSON.parse(await getFileText(profileFile.id)); } catch(e) {}
-    }
-    data.folderId = folder.id;
-    data.profileFileId = profileFile ? profileFile.id : null;
-    data.pictureFileId = pictureFile ? pictureFile.id : null;
-    data.cnicFrontFileId = cnicFrontFile ? cnicFrontFile.id : null;
-    data.cnicBackFileId = cnicBackFile ? cnicBackFile.id : null;
-    if (pictureFile) data.picture = await getFileDataUrl(pictureFile.id);
-    if (cnicFrontFile) data.cnicFront = await getFileDataUrl(cnicFrontFile.id);
-    if (cnicBackFile) data.cnicBack = await getFileDataUrl(cnicBackFile.id);
-    if (!data.id) data.id = folder.id;
-    return data;
-  }));
+  const results = [];
+  const concurrency = 5;
+  for (let i = 0; i < folders.length; i += concurrency) {
+    const batch = folders.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(async folder => {
+      const children = await listChildFiles(folder.id);
+      const profileFile = children.find(f => f.name === 'profile.json');
+      const pictureFile = children.find(f => f.name === 'picture.jpg');
+      const cnicFrontFile = children.find(f => f.name === 'cnic_front.jpg');
+      const cnicBackFile = children.find(f => f.name === 'cnic_back.jpg');
+      let data = {};
+      if (profileFile) { try { data = JSON.parse(await getFileText(profileFile.id)); } catch(e) { console.warn('Invalid profile.json:', folder.id, e); } }
+      data.folderId = folder.id;
+      data.profileFileId = profileFile ? profileFile.id : null;
+      data.pictureFileId = pictureFile ? pictureFile.id : null;
+      data.cnicFrontFileId = cnicFrontFile ? cnicFrontFile.id : null;
+      data.cnicBackFileId = cnicBackFile ? cnicBackFile.id : null;
+      if (!data.id) data.id = folder.id;
+      return data;
+    }));
+    results.push(...batchResults);
+  }
+  return results;
 }
 
 async function loadAllFromDrive() {
+  assetCache.clear();
   currentEmployees = await loadEmployeesFromFolder(currentFolderId);
   resignedEmployees = await loadEmployeesFromFolder(resignedFolderId);
 }
@@ -635,36 +565,9 @@ async function updateEmployeeInDrive(data) {
   delete data._cnicBackChanged;
 }
 
-function askPassword(actionLabel, onSuccess) {
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="panel pw-modal-box">
-      <div class="eyebrow">SECURITY CHECK</div>
-      <h3 class="glow" style="margin:8px 0 16px;font-size:16px;">${esc(actionLabel)}</h3>
-      <div class="field"><input type="password" id="pw-input" placeholder="Enter password" autocomplete="off"></div>
-      <div id="pw-err" style="color:var(--red);font-size:11px;min-height:14px;margin-bottom:10px;"></div>
-      <div style="display:flex;gap:10px;justify-content:center;">
-        <button class="btn cyan" id="pw-cancel">Cancel</button>
-        <button class="btn" id="pw-confirm">Confirm</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
-  const input = overlay.querySelector('#pw-input');
-  input.focus();
-  function confirmFn() {
-    if (input.value === APP_PASSWORD) {
-      overlay.remove();
-      onSuccess();
-    } else {
-      overlay.querySelector('#pw-err').textContent = 'Incorrect password.';
-      input.value = '';
-      input.focus();
-    }
-  }
-  overlay.querySelector('#pw-confirm').onclick = confirmFn;
-  overlay.querySelector('#pw-cancel').onclick = () => overlay.remove();
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') confirmFn(); });
+function authorizeAction(actionLabel, onSuccess) {
+  // Client-side prompts are only UX confirmations; real authorization is the Google allowlist + Drive permissions.
+  if (confirm(actionLabel + '?')) onSuccess();
 }
 
 function compressImage(file, maxW, quality) {
@@ -697,42 +600,13 @@ function renderLoading(msg) {
     </div>`;
 }
 
-function renderPinLock() {
-  app.innerHTML = `
-    <div id="login-screen">
-      <div class="eyebrow" style="text-align:center;">OPTP SCH III // ACCESS CONTROL</div>
-      <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
-      <div class="panel login-box">
-        <div class="stat-line" style="font-size:13px;margin-bottom:14px;">Enter authorization password to continue.</div>
-        <div class="field" style="text-align:left;">
-          <input type="password" id="pinlock-input" placeholder="Password" autocomplete="off">
-        </div>
-        <div id="pinlock-err" style="color:var(--red);font-size:11.5px;min-height:16px;margin:6px 0 4px;"></div>
-        <button class="btn" id="pinlock-btn" style="width:100%;margin-top:8px;">Unlock</button>
-      </div>
-    </div>`;
-  const input = document.getElementById('pinlock-input');
-  input.focus();
-  function tryUnlock() {
-    if (input.value === APP_PASSWORD) {
-      attemptAutoLogin();
-    } else {
-      document.getElementById('pinlock-err').textContent = 'Incorrect password.';
-      input.value = '';
-      input.focus();
-    }
-  }
-  document.getElementById('pinlock-btn').onclick = tryUnlock;
-  input.addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); });
-}
-
 function renderLogin() {
   app.innerHTML = `
     <div id="login-screen">
       <div class="eyebrow" style="text-align:center;">OPTP SCH III // AUTHENTICATION</div>
       <h1 class="glow" style="text-align:center;font-size:24px;margin:8px 0 26px;">EMPLOYEE RECORD SYSTEM<span class="term-cursor"></span></h1>
       <div class="panel login-box">
-        <div class="stat-line" style="font-size:13px;margin-bottom:10px;">Sign in with authorized Google Workspace account.</div>
+        <div class="stat-line" style="font-size:13px;margin-bottom:10px;">Sign in with an authorized Google account.</div>${!assertConfigured() ? '<div style="color:var(--amber);font-size:11px;margin:10px 0;">Setup required: add your authorized email to CONFIG.AUTHORIZED_EMAILS.</div>' : ''}
         <div class="gsi-btn-wrap">
           <button class="btn" id="google-login-btn" style="padding:12px 26px;">Sign in with Google</button>
         </div>
@@ -778,7 +652,7 @@ function renderDashboard() {
   </div>`;
   document.getElementById('logout-btn').onclick = logoutFlow;
   document.getElementById('card-current').onclick = () => { view = 'current'; render(); };
-  document.getElementById('card-new').onclick = () => askPassword('Add New Employee', () => { view = 'new'; render(); });
+  document.getElementById('card-new').onclick = () => authorizeAction('Open New Employee form', () => { view = 'new'; render(); });
   document.getElementById('card-resigned').onclick = () => { view = 'resigned'; render(); };
 }
 
@@ -1050,11 +924,24 @@ function fileGridHTML(list, statusClass) {
   if (!list.length) return `<div class="empty-note panel">No records found.</div>`;
   return `<div class="file-grid">` + list.map(emp => `
     <div class="panel file-card" data-id="${esc(emp.id)}">
-      ${emp.picture ? `<img class="file-thumb" src="${esc(emp.picture)}">` : `<div class="file-thumb placeholder">&#128100;</div>`}
+      ${emp.picture ? `<img class="file-thumb lazy-thumb" src="${esc(emp.picture)}">` : emp.pictureFileId ? `<img class="file-thumb lazy-thumb" data-file-id="${esc(emp.pictureFileId)}" alt="Employee photo">` : `<div class="file-thumb placeholder">&#128100;</div>`}
       <div class="file-name">${esc(emp.fullName || '(No name)')}</div>
       <div class="file-id">${esc(emp.cnic || emp.id)}</div>
       <div class="file-status ${statusClass}">${emp.status === 'current' ? 'Active' : esc(emp.exitType || 'Archived')}</div>
     </div>`).join('') + `</div>`;
+}
+
+function wireLazyThumbs() {
+  const imgs = document.querySelectorAll('img.lazy-thumb[data-file-id]');
+  if (!imgs.length) return;
+  const load = async img => {
+    if (img.dataset.loaded === '1') return;
+    img.dataset.loaded = '1';
+    try { img.src = await getFileDataUrl(img.dataset.fileId); } catch(e) { img.replaceWith(Object.assign(document.createElement('div'), { className:'file-thumb placeholder', textContent:'📷' })); }
+  };
+  if (!('IntersectionObserver' in window)) { imgs.forEach(load); return; }
+  const observer = new IntersectionObserver(entries => entries.forEach(entry => { if (entry.isIntersecting) { load(entry.target); observer.unobserve(entry.target); } }), { rootMargin:'200px' });
+  imgs.forEach(img => observer.observe(img));
 }
 
 function filterList(list, query) {
@@ -1107,6 +994,7 @@ function wireFileCardClicks(source) {
   document.querySelectorAll('.file-card').forEach(card => {
     card.onclick = () => openDetail(card.getAttribute('data-id'), source);
   });
+  wireLazyThumbs();
 }
 
 function pfield(label, value) {
@@ -1181,116 +1069,81 @@ function buildPrintableHTML(emp) {
 function openPrintableRecord(emp) {
   const html = buildPrintableHTML(emp);
   const w = window.open('', '_blank', 'width=900,height=1000');
-  if (!w) {
-    toast('Popup blocked by browser.', true);
-    return;
-  }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
+  if (!w) { toast('Popup blocked by browser.', true); return; }
+  w.document.open(); w.document.write(html); w.document.close();
   const triggerPrint = () => { try { w.focus(); w.print(); } catch(e) {} };
-  w.onload = triggerPrint;
-  setTimeout(triggerPrint, 350);
+  w.onload = triggerPrint; setTimeout(triggerPrint, 500);
+}
+
+async function downloadEmployeePDF(emp) {
+  try {
+    if (!window.html2canvas || !window.jspdf) { toast('PDF engine is still loading. Try again.', true); return; }
+    await loadEmployeeAssets(emp, true);
+    const holder = document.createElement('div');
+    holder.style.cssText = 'position:fixed;left:-100000px;top:0;width:794px;background:#fff;z-index:-1;';
+    const printable = buildPrintableHTML(emp);
+    const styleMatch = printable.match(/<style>([\s\S]*?)<\/style>/i);
+    const bodyMatch = printable.match(/<body>([\s\S]*?)<\/body>/i);
+    const style = styleMatch ? `<style>${styleMatch[1]}</style>` : '';
+    const body = bodyMatch ? bodyMatch[1] : printable;
+    holder.innerHTML = style + `<div class="pdf-page-content">${body}</div>`;
+    document.body.appendChild(holder);
+    const canvas = await html2canvas(holder, {scale:2, useCORS:true, backgroundColor:'#fff', logging:false});
+    holder.remove();
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF('p','mm','a4');
+    const pageW = 210, pageH = 297, margin = 8;
+    const imgW = pageW - margin*2;
+    const pxPerPage = Math.floor(canvas.width * ((pageH-margin*2) / imgW));
+    let y = 0, page = 0;
+    while (y < canvas.height) {
+      const sliceH = Math.min(pxPerPage, canvas.height-y);
+      const slice = document.createElement('canvas'); slice.width = canvas.width; slice.height = sliceH;
+      slice.getContext('2d').drawImage(canvas,0,y,canvas.width,sliceH,0,0,canvas.width,sliceH);
+      const img = slice.toDataURL('image/jpeg',0.92);
+      const imgH = sliceH * imgW / canvas.width;
+      if (page > 0) pdf.addPage();
+      pdf.addImage(img,'JPEG',margin,margin,imgW,imgH);
+      y += sliceH; page++;
+    }
+    const safeName = (emp.fullName || 'Employee_Record').replace(/[^a-z0-9_-]+/gi,'_');
+    pdf.save(`${safeName}_Employee_Record.pdf`);
+    toast('PDF downloaded successfully.');
+  } catch(e) { console.error(e); toast('PDF generation failed. Use Print as fallback.', true); }
 }
 
 function detailRow(k, v) {
   return `<div class="detail-item"><div class="k">${esc(k)}</div><div class="v">${(v === undefined || v === '') ? '—' : esc(v)}</div></div>`;
 }
 
-function openDetail(id, source) {
+async function openDetail(id, source) {
   const list = source === 'current' ? currentEmployees : resignedEmployees;
   const emp = list.find(e => e.id === id);
   if (!emp) return;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="panel modal-box">
-      <span class="modal-close" id="detail-close">&times;</span>
-      <div class="eyebrow">${source === 'current' ? 'ACTIVE FILE' : 'ARCHIVED FILE'}</div>
-      <h2 class="glow" style="margin:6px 0 4px;">${esc(emp.fullName || '(No name)')}</h2>
-      <div class="stat-line">${esc(emp.position || '')}</div>
-      <div class="doc-thumbs">
-        <div>${emp.picture ? `<img src="${emp.picture}">` : ''}<div class="lbl">Picture</div></div>
-        <div>${emp.cnicFront ? `<img src="${emp.cnicFront}">` : ''}<div class="lbl">CNIC Front</div></div>
-        <div>${emp.cnicBack ? `<img src="${emp.cnicBack}">` : ''}<div class="lbl">CNIC Back</div></div>
-      </div>
-      <div class="detail-grid">
-        ${detailRow('Position', emp.position)}
-        ${detailRow('Salary', emp.salary)}
-        ${detailRow('Full Name', emp.fullName)}
-        ${detailRow('Father Name', emp.fatherName)}
-        ${detailRow('DOB', emp.dob)}
-        ${detailRow('CNIC', emp.cnic)}
-        ${detailRow('Gender', emp.gender)}
-        ${detailRow('Joining Date', emp.joiningDate)}
-        ${detailRow('Marital Status', emp.relationshipStatus)}
-        ${detailRow('Children', emp.childrenCount)}
-        ${detailRow('Permanent Address', emp.permanentAddress)}
-        ${detailRow('Temporary Address', emp.temporaryAddress)}
-        ${detailRow('Mobile Number', emp.mobileNumber)}
-        ${detailRow('Emergency Contact', emp.homeNumber)}
-        ${detailRow('Email', emp.email)}
-        ${detailRow('Qualification', emp.qualification)}
-        ${detailRow('Qualification Detail', emp.qualificationDetail)}
-        ${detailRow('Previous Experience', emp.previousExperience)}
-        ${detailRow('Experience Detail', emp.prevExpDetail)}
-        ${detailRow('Previous Salary', emp.prevSalary)}
-        ${detailRow('Reason for Leaving', emp.prevReason)}
-        ${source === 'resigned' ? detailRow('Exit Type', emp.exitType) : ''}
-        ${source === 'resigned' ? detailRow('Exit Date', emp.exitDate) : ''}
-        ${source === 'resigned' ? detailRow('Exit Note', emp.exitNote) : ''}
-      </div>
-      <div class="modal-actions">
-        <button class="btn cyan" id="print-btn">Print</button>
-        <button class="btn cyan" id="pdf-btn">Save PDF</button>
-        <button class="btn cyan" id="edit-btn">Edit</button>
-        ${source === 'current' ? `<button class="btn amber" id="resign-btn">Mark Resigned</button>` : `<button class="btn amber" id="reactivate-btn">Reactivate</button>`}
-        <button class="btn red" id="delete-btn">Delete</button>
-      </div>
-    </div>`;
+  overlay.innerHTML = `<div class="panel modal-box"><span class="modal-close" id="detail-close">&times;</span><div class="eyebrow">${source === 'current' ? 'ACTIVE FILE' : 'ARCHIVED FILE'}</div><h2 class="glow" style="margin:6px 0 4px;">${esc(emp.fullName || '(No name)')}</h2><div class="stat-line">${esc(emp.position || '')}</div><div id="detail-assets" class="doc-thumbs"><div class="empty-note">Loading documents...</div></div><div class="detail-grid" id="detail-fields"></div><div class="modal-actions"><button class="btn cyan" id="print-btn">Print</button><button class="btn cyan" id="pdf-btn">Save PDF</button><button class="btn cyan" id="edit-btn">Edit</button>${source === 'current' ? `<button class="btn amber" id="resign-btn">Mark Resigned</button>` : `<button class="btn amber" id="reactivate-btn">Reactivate</button>`}<button class="btn red" id="delete-btn">Delete</button></div></div>`;
   document.body.appendChild(overlay);
-  document.getElementById('detail-close').onclick = () => overlay.remove();
-  document.getElementById('print-btn').onclick = () => askPassword('Print Authorization', () => openPrintableRecord(emp));
-  document.getElementById('pdf-btn').onclick = () => askPassword('PDF Export Authorization', () => openPrintableRecord(emp));
-  document.getElementById('edit-btn').onclick = () => askPassword('Edit Authorization', () => { overlay.remove(); openEditForm(emp, source); });
-  document.getElementById('delete-btn').onclick = () => askPassword('Delete Authorization', () => {
-    if (!confirm(`Permanently trash "${emp.fullName || 'this file'}" on Google Drive?`)) return;
-    trashFolder(emp.folderId).then(() => {
-      const arr = source === 'current' ? currentEmployees : resignedEmployees;
-      const idx = arr.findIndex(e => e.id === id);
-      if (idx > -1) arr.splice(idx, 1);
-      overlay.remove();
-      toast('Moved to Drive Trash.');
-      render();
-    }).catch(() => toast('Delete request failed.', true));
+  overlay.querySelector('#detail-close').onclick = () => overlay.remove();
+  const fields = [['Position',emp.position],['Salary',emp.salary],['Full Name',emp.fullName],['Father Name',emp.fatherName],['DOB',emp.dob],['CNIC',emp.cnic],['Gender',emp.gender],['Joining Date',emp.joiningDate],['Marital Status',emp.relationshipStatus],['Children',emp.childrenCount],['Permanent Address',emp.permanentAddress],['Temporary Address',emp.temporaryAddress],['Mobile Number',emp.mobileNumber],['Emergency Contact',emp.homeNumber],['Email',emp.email],['Qualification',emp.qualification],['Qualification Detail',emp.qualificationDetail],['Previous Experience',emp.previousExperience],['Experience Detail',emp.prevExpDetail],['Previous Salary',emp.prevSalary],['Reason for Leaving',emp.prevReason]];
+  if (source === 'resigned') fields.push(['Exit Type',emp.exitType],['Exit Date',emp.exitDate],['Exit Note',emp.exitNote]);
+  overlay.querySelector('#detail-fields').innerHTML = fields.map(([k,v]) => detailRow(k,v)).join('');
+  try {
+    await loadEmployeeAssets(emp, true);
+    if (!document.body.contains(overlay)) return;
+    overlay.querySelector('#detail-assets').innerHTML = `<div>${emp.picture ? `<img src="${esc(emp.picture)}">` : ''}<div class="lbl">Picture</div></div><div>${emp.cnicFront ? `<img src="${esc(emp.cnicFront)}">` : ''}<div class="lbl">CNIC Front</div></div><div>${emp.cnicBack ? `<img src="${esc(emp.cnicBack)}">` : ''}<div class="lbl">CNIC Back</div></div>`;
+  } catch(e) { overlay.querySelector('#detail-assets').innerHTML = `<div class="empty-note">Some documents could not be loaded.</div>`; }
+  overlay.querySelector('#print-btn').onclick = () => authorizeAction('Print employee record', () => openPrintableRecord(emp));
+  overlay.querySelector('#pdf-btn').onclick = () => authorizeAction('Generate PDF', () => downloadEmployeePDF(emp));
+  overlay.querySelector('#edit-btn').onclick = () => authorizeAction('Edit employee record', async () => { overlay.remove(); await openEditForm(emp, source); });
+  overlay.querySelector('#delete-btn').onclick = () => authorizeAction('Delete employee record', async () => {
+    if (!confirm(`Move "${emp.fullName || 'this file'}" to Google Drive Trash?`)) return;
+    try { await trashFolder(emp.folderId); const arr = source === 'current' ? currentEmployees : resignedEmployees; const idx = arr.findIndex(e => e.id === id); if (idx > -1) arr.splice(idx,1); overlay.remove(); toast('Moved to Drive Trash.'); render(); } catch(e) { toast('Delete request failed.', true); }
   });
-
-  if (source === 'current') {
-    document.getElementById('resign-btn').onclick = () => askPassword('Status Change', () => { overlay.remove(); openResignDialog(emp); });
-  } else {
-    document.getElementById('reactivate-btn').onclick = () => askPassword('Reactivate Employee', async () => {
-      try {
-        await moveFolder(emp.folderId, resignedFolderId, currentFolderId);
-        const idx = resignedEmployees.findIndex(e => e.id === id);
-        if (idx > -1) {
-          const [moved] = resignedEmployees.splice(idx, 1);
-          moved.status = 'current';
-          delete moved.exitType;
-          delete moved.exitDate;
-          delete moved.exitNote;
-          moved._pictureChanged = false;
-          await updateFileContent(moved.profileFileId, 'application/json', JSON.stringify(profileCopyOf(moved)), true);
-          currentEmployees.push(moved);
-        }
-        overlay.remove();
-        toast('Employee reactivated.');
-        view = 'current';
-        render();
-      } catch(e) {
-        toast('Reactivation failed.', true);
-      }
-    });
-  }
+  if (source === 'current') overlay.querySelector('#resign-btn').onclick = () => authorizeAction('Change employee status', () => { overlay.remove(); openResignDialog(emp); });
+  else overlay.querySelector('#reactivate-btn').onclick = () => authorizeAction('Reactivate employee', async () => {
+    try { await moveFolder(emp.folderId, resignedFolderId, currentFolderId); const idx = resignedEmployees.findIndex(e => e.id === id); if (idx > -1) { const [moved] = resignedEmployees.splice(idx,1); moved.status='current'; delete moved.exitType; delete moved.exitDate; delete moved.exitNote; await updateFileContent(moved.profileFileId,'application/json',JSON.stringify(profileCopyOf(moved)),true); currentEmployees.push(moved); } overlay.remove(); toast('Employee reactivated.'); view='current'; render(); } catch(e) { toast('Reactivation failed.', true); }
+  });
 }
 
 function openResignDialog(emp) {
@@ -1352,7 +1205,8 @@ function openResignDialog(emp) {
   };
 }
 
-function openEditForm(emp, source) {
+async function openEditForm(emp, source) {
+  try { await loadEmployeeAssets(emp, true); } catch(e) {}
   const store = Object.assign({}, emp);
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -1418,8 +1272,7 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 
 function render(loadingMsg) {
-  if (view === 'pinlock') renderPinLock();
-  else if (view === 'login') renderLogin();
+  if (view === 'login') renderLogin();
   else if (view === 'loading') renderLoading(loadingMsg);
   else if (view === 'dashboard') renderDashboard();
   else if (view === 'new') renderNewEmployee();
