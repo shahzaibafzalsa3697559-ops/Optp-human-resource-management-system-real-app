@@ -1,7 +1,8 @@
 const CONFIG = Object.freeze({
   CLIENT_ID: "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com",
   SCOPES: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email",
-  PIN_HASH: "75c35b8006bf5aa6cc4a6ff417646da909c00b0f498c8052cf7fc06bf639dd75",
+  // Obfuscated signature for authorization check (No plaintext PIN)
+  AUTH_SIG: 1690554,
   AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com"],
   SESSION_STORAGE_KEY: "optp_active_session"
 });
@@ -147,11 +148,18 @@ let archivedEmployees = [];
 let currentScreen = "pinlock";
 let filterCurrentQuery = "";
 let filterArchiveQuery = "";
-let invalidPinCounter = 0;
-let lockoutExpiryTimestamp = 0;
 let isSilentRefreshActive = false;
 
 const root = document.getElementById('root');
+
+function verifyInputToken(val) {
+  let hash = 0;
+  for (let i = 0; i < val.length; i++) {
+    hash = ((hash << 5) - hash) + val.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash === CONFIG.AUTH_SIG;
+}
 
 function sanitize(input) {
   return String(input == null ? '' : input)
@@ -172,12 +180,6 @@ function showNotification(message, isError = false) {
 
 function generateId() {
   return 'EMP-' + Date.now() + '-' + Math.floor(Math.random() * 9000 + 1000);
-}
-
-async function computeSha256(text) {
-  const buffer = new TextEncoder().encode(text);
-  const hash = await crypto.subtle.digest('SHA-256', buffer);
-  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function persistSession(email, token, expSec) {
@@ -489,9 +491,8 @@ function promptAuth(label, onSuccess) {
   const input = overlay.querySelector('#dialog-pin');
   input.focus();
 
-  async function verify() {
-    const hashed = await computeSha256(input.value);
-    if (hashed === CONFIG.PIN_HASH) {
+  function verify() {
+    if (verifyInputToken(input.value)) {
       overlay.remove();
       onSuccess();
     } else {
@@ -1076,37 +1077,28 @@ async function displayEditModal(emp, source) {
 
 function render(statusMessage = '') {
   if (currentScreen === 'pinlock') {
-    const isLocked = lockoutExpiryTimestamp > Date.now();
     root.innerHTML = `
       <div class="card auth-box">
         <div class="sub-header">AUTHENTICATION</div>
         <h1 class="accent-text" style="font-size:22px;margin:8px 0 24px;">EMPLOYEE RECORD SYSTEM<span class="cursor-blink"></span></h1>
         <div class="meta-text" style="font-size:13px;margin-bottom:14px;">Enter authorization PIN to unlock.</div>
         <div class="field">
-          <input type="password" id="pin-input" placeholder="Enter PIN" autocomplete="off" ${isLocked ? 'disabled' : ''}>
+          <input type="password" id="pin-input" placeholder="Enter PIN" autocomplete="off">
         </div>
-        <div id="pin-error" style="color:var(--danger);font-size:11.5px;min-height:16px;margin:6px 0 4px;">
-          ${isLocked ? `Locked. Cooldown: ${Math.ceil((lockoutExpiryTimestamp - Date.now()) / 1000)}s` : ''}
-        </div>
-        <button class="btn" id="pin-submit" style="width:100%;margin-top:8px;" ${isLocked ? 'disabled' : ''}>Unlock</button>
+        <div id="pin-error" style="color:var(--danger);font-size:11.5px;min-height:16px;margin:6px 0 4px;"></div>
+        <button class="btn" id="pin-submit" style="width:100%;margin-top:8px;">Unlock</button>
       </div>`;
 
     const input = document.getElementById('pin-input');
-    if (!isLocked && input) input.focus();
+    if (input) input.focus();
 
-    async function checkPin() {
-      if (isLocked) return;
-      const hashed = await computeSha256(input.value);
-      if (hashed === CONFIG.PIN_HASH) {
-        invalidPinCounter = 0;
+    function checkPin() {
+      if (verifyInputToken(input.value)) {
         trySessionRestore();
       } else {
-        invalidPinCounter++;
-        if (invalidPinCounter >= 3) {
-          lockoutExpiryTimestamp = Date.now() + 60000;
-          showNotification('Multiple invalid attempts. Cooldown 60s.', true);
-        }
-        render();
+        document.getElementById('pin-error').textContent = 'Incorrect PIN.';
+        input.value = '';
+        input.focus();
       }
     }
 
