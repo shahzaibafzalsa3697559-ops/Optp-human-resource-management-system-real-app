@@ -4,21 +4,21 @@
   --bg-input: #ffffff;
   --border: #e2e8f0;
   --border-focus: #2563eb;
-  
+
   --primary: #0f172a;
   --primary-hover: #1e293b;
   --brand: #2563eb;
   --brand-hover: #1d4ed8;
-  
+
   --accent-green: #10b981;
   --accent-amber: #f59e0b;
   --danger: #ef4444;
   --danger-hover: #dc2626;
-  
+
   --text-main: #0f172a;
   --text-muted: #64748b;
   --text-light: #94a3b8;
-  
+
   --radius-sm: 4px;
   --radius: 8px;
   --radius-lg: 12px;
@@ -70,7 +70,7 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
-/* Professional Buttons */
+/* Buttons */
 .btn {
   font-family: inherit;
   font-size: 13px;
@@ -212,8 +212,6 @@ label {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-lg);
 }
-
-.cursor-blink { display: none; }
 
 /* Top Navigation Bar */
 #nav {
