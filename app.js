@@ -2,7 +2,7 @@ const CONFIG = Object.freeze({
   CLIENT_ID: "936109847577-ajbaefe746dalhe6vn7ae0u2pdl26sds.apps.googleusercontent.com",
   SCOPES: "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email",
   APP_PIN: "6666",
-  AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com"],
+  AUTHORIZED_EMAILS: ["shahzaibafzalsa3697559@gmail.com", "optpscheme3@gmail.com", "softhackcodingkarwan@gmail.com"],
   SESSION_STORAGE_KEY: "optp_active_session"
 });
 
